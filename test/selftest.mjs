@@ -23,7 +23,7 @@ import { materialize, findFlClashConfig, forceExternalController, forceDnsPort, 
 import { ensureKernel, latestVersion } from '../lib/downloader.js';
 import { ProxyCore } from '../lib/core.js';
 import { countProxies, countRules, configSummary, writeManualConfig } from '../lib/settings.js';
-import { listProxies, testConnectivity, sampleActivity } from '../lib/nodes.js';
+import { listProxies, testConnectivity, sampleActivity, FAILED_AT_MS } from '../lib/nodes.js';
 import { buildRestoreScript } from '../lib/systemproxy.js';
 
 const RUNTIME = 'C:\\Users\\暝\\AppData\\Local\\Temp\\dsh-proxy-selftest';
@@ -343,6 +343,30 @@ try {
       !list.nodes?.some((n) => /^(DIRECT|REJECT)$/.test(n.name)), '');
     check('5e 信息伪节点已过滤',
       !list.nodes?.some((n) => /^(剩余流量|套餐到期|距离下次)/.test(n.name)), '');
+
+    // 延迟语义（2026-10-13 用户报「全部超时」的回归锁）。
+    //
+    // 两个坑：
+    //   ① `delay === 0` 是「**这一次**没测通」，不是「节点坏了」。实测 history
+    //      常是 `246,0,197` —— 中间那次失败，前后都正常。旧面板把它渲染成红色的
+    //      「超时」，用户以为 140 个节点全挂了。
+    //   ② **`delay` 顶到 timeout 上限也是失败**。实测两种档位都有：
+    //      `悦·🇸🇬新加坡2 · A` history `3000,2999,0`（3000 档打满）、
+    //      `悦·🇦🇺澳大利亚2 · A` 末条 5000（5000 档打满）。旧代码把它们渲染成
+    //      绿色的「3000 ms / 5000 ms」，语义正好反了。
+    //      阈值是常数 4999 —— 因为 mihomo 的 `/proxies` **不回读 timeout 字段**，
+    //      分组的真上限拿不到（实测全部自动测速分组都是 undefined）。
+    const withDelay = (list.nodes ?? []).filter((n) => n.delay != null);
+    check('5i 每个节点都带 failed 判据（界面不必自己猜 0 的含义）',
+      (list.nodes ?? []).every((n) => typeof n.failed === 'boolean'),
+      `${withDelay.length} 个节点有延迟值`);
+    check('5j delay===0 判为失败',
+      (list.nodes ?? []).every((n) => n.delay !== 0 || n.failed === true), '');
+    check('5k delay 顶到超时上限同样判为失败（不能只判 0）',
+      (list.nodes ?? []).every((n) => n.delay == null || n.delay < FAILED_AT_MS || n.failed === true),
+      `阈值 ${FAILED_AT_MS}ms`);
+    check('5l 正常延迟不误判为失败',
+      (list.nodes ?? []).every((n) => !(n.failed === true && n.delay != null && n.delay > 0 && n.delay < FAILED_AT_MS)), '');
 
     // 连通性测试：真的以某个节点为出口发一次请求。
     // 不强求「必须有可用节点」—— 节点可用性取决于订阅本身，
