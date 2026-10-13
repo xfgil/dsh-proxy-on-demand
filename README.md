@@ -128,7 +128,17 @@ dsh plugin --profile desktop add link:D:/path/to/plugins/dsh-proxy-on-demand
 dsh plugin --profile <你的profile> add dsh-proxy-on-demand
 ```
 
-装完之后，profile 清单（`dsh.profile.bundles`）会被自动更新。宿主自带的 HMR 监听到清单变化后会自己 reconcile，插件即刻生效 —— **不需要重启**。
+装完之后，profile 清单（`dsh.profile.bundles`）会被自动更新。
+
+> **⚠ 对「宿主正在运行时才装的新插件」：光改清单不够，需要再关开一次这个 bundle。**
+> 宿主**不会**为运行中新加入的 bundle 自动挂载 —— HMR 只 reconcile 已经存在于
+> loader 树里的 entry。实测：清单写好了、`node_modules` 链接也建了，但
+> `plugin_manager list_plugins` 里就是没有这个包，HTTP 端点 404。此时把它关掉再打开
+> （`plugin_manager set_bundle {target, enabled:false}` → 再 `enabled:true`，两次都会返回
+> `{"changed":true,"application":"applied"}`），宿主侧端点立刻 200、客户端界面同时注册进
+> slot 树。**不需要重启宿主。**
+>
+> 反过来，如果插件目录/链接在宿主**启动之前**就存在，宿主启动时会一并加载，就不必这一步。
 
 > 手工安装（不走 CLI）也可以：在 profile 的 `package.json` 里加
 > `"dsh-proxy-on-demand": "link:D:/path/to/plugins/dsh-proxy-on-demand"`，

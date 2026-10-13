@@ -144,8 +144,21 @@ From npm (if you're using a published release):
 dsh plugin --profile <your-profile> add dsh-proxy-on-demand
 ```
 
-The profile manifest (`dsh.profile.bundles`) is updated for you, and the host's
-HMR picks up the change and reconciles — the plugin is live **without a restart**.
+The profile manifest (`dsh.profile.bundles`) is updated for you.
+
+> **⚠ For a plugin installed while the host is already running: editing the
+> manifest is not enough — toggle this bundle off and on once.**
+> The host does **not** auto-mount a bundle that appears mid-run; HMR only
+> reconciles entries already present in the loader tree. Measured: manifest
+> written, `node_modules` link created, yet the package was simply absent from
+> `plugin_manager list_plugins` and its HTTP endpoint returned 404. Toggling it
+> (`plugin_manager set_bundle {target, enabled:false}` then `enabled:true`; both
+> return `{"changed":true,"application":"applied"}`) made the host endpoint return
+> 200 immediately and registered the client UI into the slot tree. **No host
+> restart was needed.**
+>
+> Conversely, if the plugin directory/link already existed **before** the host
+> started, it is loaded at startup and this step is unnecessary.
 
 > Installing by hand also works: add
 > `"dsh-proxy-on-demand": "link:D:/path/to/plugins/dsh-proxy-on-demand"` to the profile's
