@@ -32,6 +32,9 @@ import { ensureKernel, latestVersion, DEFAULT_MIRRORS } from '../lib/downloader.
 import { findFlClashConfig, materialize, exampleConfig } from '../lib/config.js';
 import { ProxyCore } from '../lib/core.js';
 import { configSummary, readSettings, writeSettings } from '../lib/settings.js';
+import { describeHit, detectGames, gameGate } from '../lib/games.js';
+import { describePeer, detectPeers, peerGate as peerGateFn } from '../lib/peers.js';
+import { disposeProbe } from '../lib/probe.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const RUNTIME = process.env.DSH_PROXY_RUNTIME || join(ROOT, 'runtime');
@@ -57,6 +60,8 @@ function parse(argv) {
     if (a === '--idle') { opts.idle = Number(argv[++i]); continue; }
     if (a === '--port') { opts.port = Number(argv[++i]); continue; }
     if (a === '--no-wait') { opts.noWait = true; continue; }
+    if (a === '--no-gate') { opts.noGate = true; continue; }
+    if (a === '--no-peer') { opts.noPeer = true; continue; }
     if (a === '--json') { opts.json = true; continue; }
     rest.push(a);
   }
@@ -70,9 +75,43 @@ const settings = await readSettings(RUNTIME);
 const port = opts.port || settings.port || 7890;
 const idleMs = opts.idle != null ? opts.idle * 1000 : (settings.idleMs ?? 120000);
 
+/**
+ * 游戏闸门（与宿主侧同一条规则，见 lib/games.js）。
+ *
+ * CLI 也遵守「游戏运行时禁止启用代理」——否则用户在游戏里跑一条
+ * `dsh-proxy -- curl ...` 就绕过了整个保护，那这个功能就没意义了。
+ * 显式传 --no-gate 可以绕过（用户明确知道自己要什么）。
+ */
+const gate = opts.noGate ? null : () => gameGate({
+  blockOnGame: settings.blockOnGame !== false,
+  runtimeDir: RUNTIME,
+});
+
+/** 检测到游戏时是否关掉已在运行的内核（默认关，与「只拦新的」一致）。 */
+const gameWatch = opts.noGate ? null : () => {
+  if (settings.stopOnGame !== true) return Promise.resolve({ gameRunning: false });
+  return detectGames({ runtimeDir: RUNTIME })
+    .then((d) => ({ gameRunning: d.gameRunning, what: describeHit(d) }));
+};
+
+/**
+ * 礼让闸门（与宿主侧同一条规则，见 lib/peers.js）。
+ *
+ * 别的代理（FlClash 等）已经在跑时，本插件不启动自己的内核 —— 不抢端口、
+ * 不改网络环境。只看端口占用，不认软件名字。--no-peer 可本次强行启用。
+ *
+ * ⚠ ownAlive 由 core 算好传进来：我们自己就监听这个端口，不排除自己的话
+ *   内核一跑起来就会把自己当成「别的代理」，从此永远自我阻断。
+ */
+const peerGate = opts.noPeer ? null : ({ ownAlive } = {}) => peerGateFn({
+  yieldToPeer: settings.yieldToPeer !== false,
+  ownPort: port,
+  ownAlive: ownAlive === true,
+});
+
 const core = new ProxyCore({
   dir: RUNTIME, exe: 'mihomo.exe', config: 'config.yaml',
-  port, idleMs, log,
+  port, idleMs, log, gate, gameWatch, peerGate,
 });
 
 /** 确保内核与配置就位。 */
@@ -144,7 +183,28 @@ switch (cmd) {
   }
   case 'start': {
     await prepare();
-    const r = await core.ensureRunning();
+    let r;
+    try {
+      r = await core.ensureRunning();
+    } catch (e) {
+      if (e?.code === 'GAME_BLOCKED') {
+        console.error('');
+        console.error('⛔ ' + (e.gate?.message ?? e.message));
+        console.error('   如果这是误判（比如某个程序的无边框全屏被当成了游戏）：');
+        console.error('     dsh-proxy game           # 看看系统当前状态与前台程序');
+        console.error('   想本次强行启动，加 --no-gate。');
+        process.exit(3);
+      }
+      if (e?.code === 'PEER_BLOCKED') {
+        console.error('');
+        console.error('⛔ ' + (e.gate?.message ?? e.message));
+        console.error('   本插件不跟别的代理抢端口，这是设计如此。');
+        console.error('     dsh-proxy peers          # 看看是哪个端口被占了');
+        console.error('   想本次强行启动，加 --no-peer。');
+        process.exit(4);
+      }
+      throw e;
+    }
     core.startIdleWatcher();
     console.log(JSON.stringify({ ok: true, ...r, proxy: `http://127.0.0.1:${port}`, idleMs }, null, 2));
     if (!r.started && !r.external) log('info', '内核已在运行');
@@ -156,6 +216,32 @@ switch (cmd) {
       await waitGone(true);
       log('info', '内核已按空闲策略自动关闭');
     }
+    break;
+  }
+  case 'game': {
+    // dsh-proxy game [--json]
+    const d = await detectGames({ runtimeDir: RUNTIME, force: true });
+    if (opts.json) { console.log(JSON.stringify(d, null, 2)); break; }
+    console.log(`游戏检测：${d.gameRunning ? '⛔ 检测到游戏运行' : '✓ 没有检测到游戏'}`);
+    console.log(`  系统状态：${d.qunsName ?? '-'}（QUNS ${d.quns ?? '-'}）`);
+    console.log(`  探测：${d.probeOk ? `正常（${d.probeMs ?? '-'}ms）` : `不可用（${d.probeError ?? '未知'}）`}`);
+    if (d.fg) console.log(`  前台程序：${d.fg.name || '未知'}${d.fg.path ? `  ${d.fg.path}` : ''}`);
+    if (d.gameRunning) console.log(`  原因：${describeHit(d)}`);
+    console.log(`  判定用时：${d.ms}ms`);
+    break;
+  }
+  case 'peers': {
+    // dsh-proxy peers [--json]
+    const ownAlive = await core.ownCoreAlive();
+    const d = await detectPeers({ ownPort: port, ownAlive, force: true });
+    if (opts.json) { console.log(JSON.stringify({ ...d, ownAlive }, null, 2)); break; }
+    console.log(`代理礼让：${d.peerRunning ? '⛔ 检测到其它代理在运行' : '✓ 没有检测到其它代理'}`);
+    console.log(`  本插件端口：${port}${ownAlive ? '（本插件内核正在使用）' : ''}`);
+    if (d.hits?.length) {
+      for (const h of d.hits) console.log(`  占用：端口 ${h.port}${h.kind === 'own-port' ? '（本插件要用的端口）' : ''}`);
+    }
+    console.log(`  探测端口数：${d.probed}　用时：${d.ms}ms`);
+    console.log(`  结论：${describePeer(d)}`);
     break;
   }
   case 'stop': {
@@ -185,10 +271,32 @@ switch (cmd) {
   }
 }
 
+// 探测是一个**常驻**子进程（见 lib/probe.js），它的 stdio 管道会让 Node
+// 的事件循环一直非空 —— 不加这一句，`dsh-proxy game` 之类的短命令会跑完
+// 却不退出，看起来像卡死。这里显式收掉探测进程再让脚本自然结束。
+try { await disposeProbe(); } catch { /* 收不掉也不该影响退出码 */ }
+
 async function runCommand(args) {
   if (!args.length) { console.error('缺少要执行的命令'); process.exit(1); }
   await prepare();
-  const r = await core.ensureRunning();
+  let r;
+  try {
+    r = await core.ensureRunning();
+  } catch (e) {
+    if (e?.code === 'GAME_BLOCKED') {
+      console.error('');
+      console.error('⛔ ' + (e.gate?.message ?? e.message));
+      console.error('   如果这是误判，先 dsh-proxy game 看看系统状态；加 --no-gate 可本次强行启用。');
+      process.exit(3);
+    }
+    if (e?.code === 'PEER_BLOCKED') {
+      console.error('');
+      console.error('⛔ ' + (e.gate?.message ?? e.message));
+      console.error('   先 dsh-proxy peers 看看是哪个端口被占了；加 --no-peer 可本次强行启用。');
+      process.exit(4);
+    }
+    throw e;
+  }
   core.startIdleWatcher();
   if (r.started) log('info', `内核已启动（pid=${r.pid}, ${r.ms}ms）`);
   else if (r.external) log('info', `${port} 端口已被其他程序占用，直接复用`);
@@ -259,12 +367,16 @@ dsh-proxy-on-demand —— 按需代理
   dsh-proxy start                      启动内核（空闲后自动关）
   dsh-proxy stop                       立即关闭内核
   dsh-proxy import-flclash             从本机 FlClash 导入配置
+  dsh-proxy game                       查看游戏检测结果（系统状态 + 前台程序）
+  dsh-proxy peers                      查看是否有其它代理在运行（端口占用）
   dsh-proxy -- <命令> [参数...]         带着代理跑一条命令
 
 选项：
   --idle <秒>   空闲多久自动关（0 = 命令结束立刻关）
   --port <端口> 覆盖代理端口
   --no-wait     配合 start：立刻返回，不守着内核
+  --no-gate     本次跳过游戏检测（游戏运行时也强行启用）
+  --no-peer     本次跳过礼让检测（别的代理在跑也强行启用）
   --json        以 JSON 输出
 
 环境变量：

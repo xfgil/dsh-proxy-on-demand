@@ -38,6 +38,8 @@
 - [安装](#安装)
 - [使用](#使用)
 - [设置界面](#设置界面)
+- [游戏检测](#游戏检测)
+- [礼让其它代理](#礼让其它代理)
 - [配置](#配置)
 - [HTTP 接口](#http-接口)
 - [它是怎么做到的](#它是怎么做到的)
@@ -59,6 +61,8 @@
 - **需要时自动拉起** —— 第一次要用的时候自己下载内核、准备配置、启动进程。
 - **空闲后自动关闭** —— 默认 2 分钟没人用就杀掉内核、清掉状态文件。
 - **平时什么都不占** —— 没有常驻进程，7890 端口是空的，不会和你自己开的 Clash/FlClash 抢端口。
+- **打游戏时不添乱** —— 检测到全屏游戏就不启用代理，不改变你的网络环境（见[游戏检测](#游戏检测)）。
+- **不跟别的代理抢** —— 你已经开着 FlClash 之类的时候，它自动静默让路，一个进程都不起（见[礼让其它代理](#礼让其它代理)）。
 
 ## 它到底解决了什么问题
 
@@ -167,6 +171,7 @@ dsh-proxy prepare                    # 下载内核 + 准备配置
 dsh-proxy import-flclash             # 从本机 FlClash 导入配置
 dsh-proxy start                      # 启动内核，守着直到空闲自动关
 dsh-proxy stop                       # 立刻关掉
+dsh-proxy game                       # 看游戏检测结果
 dsh-proxy -- <命令> [参数...]         # 带着代理跑一条命令
 ```
 
@@ -176,7 +181,10 @@ dsh-proxy -- <命令> [参数...]         # 带着代理跑一条命令
 dsh-proxy -- git clone https://github.com/some/repo
 dsh-proxy --idle 0 -- curl.exe -sS https://api.ipify.org    # 跑完立刻关
 dsh-proxy --idle 600 -- npm install                          # 空闲 10 分钟才关
+dsh-proxy --no-gate -- curl.exe -sS https://api.ipify.org    # 跳过游戏检测，强行启用
 ```
+
+CLI 同样受游戏闸门约束（否则 `dsh-proxy -- ...` 就绕过了整个保护），被拦时退出码是 **3**。
 
 它给子进程注入：
 
@@ -201,11 +209,115 @@ dsh-proxy --idle 600 -- npm install                          # 空闲 10 分钟�
 | 从 FlClash 导入 | 读本机 FlClash 的 `config.yaml`，自动把规则文件的绝对路径改成相对路径 |
 | 手动粘贴 | 直接贴一份 Clash/mihomo YAML |
 
+**游戏检测** — 显示当前系统状态（`SHQueryUserNotificationState`）、前台程序，以及「有没有检测到游戏」；两个开关（游戏运行时禁止启用代理 / 检测到游戏就关掉已在运行的代理）+ 一个「立即重新检测」按钮。详见[游戏检测](#游戏检测)。
+
 **参数** — 代理端口、空闲多久自动关（秒）、启用插件、首次是否自动导入 FlClash 配置。改完立即生效。
 
 > 端口改动需要重启内核才生效：先「立即关闭」，再「立即启动」。
 
 界面**不走 DSH 的 settings 服务**，而是直接读写信件文件 + 自己的 HTTP 端点。原因见[实现说明](#实现说明)。
+
+## 游戏检测
+
+打游戏的时候不希望网络环境被改动，所以插件会在**启动内核之前**先看一眼系统状态：**检测到游戏就不让启用代理**。
+
+### 只管自己
+
+这里有个刻意的设计：**判据不看「这是哪个软件」**。
+
+没有内置的游戏清单，也没有「加速器白名单」——因为维护这种名单既不可能穷尽，又会因为漏列而把真正该拦的场景放过去。判据只问一件事：**现在这个场景像不像在全屏玩游戏**。
+
+代价是可能误判（某个程序的无边框全屏被当成游戏）。但误判的后果仅仅是代理插件这次不启动，游戏本身毫发无伤 —— 临时关掉开关，或命令行加 `--no-gate` 就能绕过。
+
+### 两条判据
+
+| 判据 | 内容 | 来源 |
+|---|---|---|
+| **主** | 系统状态 ∈ {忙碌, 独占全屏, 演示中} | `SHQueryUserNotificationState` |
+| **辅** | 前台窗口铺满整块显示器**且**没有标题栏，且不是 shell 组件 | `GetForegroundWindow` + `GetWindowLong` + `MonitorFromWindow` |
+
+主判据的意义在于：**这是 Windows 自己在说「现在别打扰用户」**。实测它能识别无边框全屏（不只是独占 D3D 全屏）—— 弹出 `FormBorderStyle=None` + 铺满屏幕的窗口时，QUNS 从 5（可打扰）变成 2（忙碌）。
+
+辅判据兜住系统没报状态的无边框全屏。它必须排除 shell 组件，否则会误判：实测 `explorer.exe` 桌面被拉到前台时 `caption=false, full=true`，**朴素判据会把它当成游戏**，但同一时刻 QUNS=5，系统明确说「可打扰」—— 这正是「QUNS 必须是主判据」的原因。
+
+`QUNS` 取值：`1=锁屏 / 2=忙碌 / 3=独占全屏 / 4=演示 / 5=可打扰 / 6=免打扰时段 / 7=应用自定`。只有 `2/3/4` 会拦。
+
+### 只拦新的，已有的不动
+
+`ensureRunning()` 在内核已在跑时直接续租返回，**不经过闸门**。所以：
+
+- 游戏开始时如果代理**没在跑** → 不许启动（返回 `409 Conflict`）。
+- 游戏开始时如果代理**已经在跑** → 保持不动，不打断你正在进行的下载。
+
+想改成「游戏一起来就关掉代理」，打开设置里的「检测到游戏就关掉已在运行的代理」（`stopOnGame`）。
+
+### 检测失败时不拦
+
+探测进程起不来、编译失败、超时 —— 这些情况下闸门**放行**。宁可放过，也不让检测本身的问题把代理彻底锁死。
+
+### 探测进程
+
+检测走一个**常驻子进程** `runtime/gameprobe.exe`（内嵌 C# 源码，用 Windows 自带的 `csc.exe` 编译，不需要装 SDK）。协议是 stdin/stdout 逐行 JSON。
+
+为什么常驻而不是每次起进程 —— 实测数据：
+
+| 方案 | 单次成本 |
+|---|---|
+| 每次 `Add-Type` 编译 | 480ms |
+| 编译成 exe，每次起进程 | 349ms |
+| 编译成 DLL + `Assembly.LoadFrom` | 8ms |
+| **常驻 exe + stdin/stdout** | **0.5ms**（冷启动 385ms，只付一次） |
+
+界面每 4 秒轮询一次，判定还有 3 秒 TTL 缓存 —— 实际系统调用频率约 3 秒一次。
+
+### 命令行
+
+```bash
+dsh-proxy game              # 看检测结果：系统状态、前台程序、判定用时
+dsh-proxy game --json       # 同样的东西，JSON 形式
+dsh-proxy --no-gate -- cmd  # 本次跳过检测，强行启用
+```
+
+被闸门拦下时 CLI 退出码是 **3**（区别于普通的 1），脚本里可以据此区分「被游戏拦了」和「真的出错了」。
+
+## 礼让其它代理
+
+如果你机器上已经有别的代理在跑（FlClash、Clash Verge、v2rayN……），本插件**自动静默让路**：不启动自己的内核、不抢端口、不改你的网络环境。别的代理退出后自动恢复。
+
+### 只看端口，不认软件
+
+判据只有一条：**常见代理端口有没有人在监听**。
+
+| | |
+|---|---|
+| 探的端口 | 18 个：`7890-7893`（Clash/mihomo）、`7897/7898`（Clash Verge Rev）、`10808-10810`（v2rayN/xray）、`1080/1081`（SOCKS 惯例）、`2080/2081`（sing-box）、`20171/20172`（Clash Verge 旧版）、`8889`（Clash for Windows）、`8118`（privoxy）、`9910`，外加本插件自己的端口 |
+| 成本 | 并发探完约 **2–3ms**（loopback 上的连接拒绝是瞬时的） |
+
+为什么不看进程名：换成任何代理软件都自动适用，不需要维护「谁是代理」的名单，也不会因为某个软件不在名单里而漏判。代价是覆盖不到两种情况 —— 代理软件开着但还没开始监听端口，以及 TUN 模式不监听端口。这两种情况下本插件会照常启动，但因为那个代理还在，命令实际走的仍是对方（见下面「端口被占时复用」）。
+
+### 必须排除自己的内核
+
+本插件自己就监听 `port`（默认 7890）。如果检测时不排除自己，内核一跑起来就会被自己认成「别的代理」，从此**永远自我阻断**。
+
+所以判定里有一条硬规则：`端口 === ownPort && 自己的内核活着` → 不算别人。`ownAlive` 由 `core` 算好再传给上层 —— 因为「这个端口上的监听是不是我自己」只有 core 知道。
+
+### 端口被占时复用，端口空闲时才拦
+
+闸门只在**准备自己起内核**时才需要开口拦人。如果 7890 已经被别人占着，`ensureRunning()` 直接标记 `external: true` 返回：命令照常能用（走的是别人已经建好的代理），而我们一个进程都不起。这是「自动静默」在正常路径上的形态。
+
+### 检测失败时不拦
+
+与游戏闸门同一原则：探测出错时放行 —— 宁可多起一次内核，也不要因为探测代码出问题就让代理彻底不可用。
+
+### 命令行
+
+```bash
+dsh-proxy peers              # 看检测结果：哪些端口被占、判定用时
+dsh-proxy peers --json       # 同样的东西，JSON 形式
+dsh-proxy --no-peer -- cmd   # 本次跳过礼让，强行启用
+```
+
+被礼让闸门拦下时 CLI 退出码是 **4**（游戏闸门是 3，普通错误是 1）。
 
 ## 配置
 
@@ -220,9 +332,14 @@ dsh-proxy --idle 600 -- npm install                          # 空闲 10 分钟�
   "autoImportFlClash": true,
   "configSource": "flclash",
   "lastSyncAt": 1760000000000,
-  "lastSyncNote": "已从 FlClash 导入（规则 44 条）"
+  "lastSyncNote": "已从 FlClash 导入（规则 44 条）",
+  "blockOnGame": true,
+  "stopOnGame": false,
+  "yieldToPeer": true
 }
 ```
+
+`blockOnGame` 默认 `true`（游戏运行时禁止启用代理），`stopOnGame` 默认 `false`（只拦新的，已有的不动），`yieldToPeer` 默认 `true`（检测到其它代理时自动让路）。
 
 `runtime/` 目录（已被 `.gitignore` 排除）里放的是运行期产物：
 
@@ -235,6 +352,7 @@ dsh-proxy --idle 600 -- npm install                          # 空闲 10 分钟�
 | `core.pid` | 当前内核 PID（只用来杀自己启动的那个） |
 | `lease.json` | 租约，记录「用到什么时候为止」 |
 | `busy.json` | 忙锁，记录「哪条长命令正在用」（按 PID 判存活） |
+| `gameprobe.exe` / `gameprobe.cs` | 游戏检测用的常驻探测进程（首次用时自动编译） |
 | `core.log` | 内核日志 |
 
 ## HTTP 接口
@@ -255,6 +373,32 @@ dsh-proxy --idle 600 -- npm install                          # 空闲 10 分钟�
 | POST | `/dsh-proxy/config/manual` | `{"text":"..."}` 手动写配置 |
 | GET | `/dsh-proxy/config/example` | 取一份模板 |
 | POST | `/dsh-proxy/fetch` | `{"url":"https://..."}` 经代理抓一次 |
+| GET | `/dsh-proxy/game` | 游戏检测状态（加 `?force=1` 绕过缓存） |
+| POST | `/dsh-proxy/game/clear-cache` | 清检测缓存，强制重新检测 |
+| GET | `/dsh-proxy/peers` | 礼让检测状态（加 `?force=1` 绕过缓存） |
+| POST | `/dsh-proxy/peers/clear-cache` | 清礼让检测缓存，强制重新检测 |
+
+被游戏闸门拦下时，`POST /start` 与 `POST /fetch` 返回 **409 Conflict**：
+
+```json
+{
+  "ok": false,
+  "blocked": true,
+  "reason": "game-running",
+  "error": "系统处于「忙碌」状态（game.exe），已按设置禁止启用代理。…"
+}
+```
+
+被礼让闸门拦下时同样是 409，`reason` 是 `peer-running`：
+
+```json
+{
+  "ok": false,
+  "blocked": true,
+  "reason": "peer-running",
+  "error": "检测到其它代理正在运行（端口 10808 正在被监听），已按设置自动静默让路，不启动本插件的内核。…"
+}
+```
 
 ## 它是怎么做到的
 
@@ -279,6 +423,58 @@ dsh-proxy --idle 600 -- npm install                          # 空闲 10 分钟�
 2. **端口被占时不抢。** 如果 7890 已经被别的程序监听（比如用户开了 FlClash），插件不启动内核，只标记 `external` 后照常可用，也**不会**在空闲时去关那个不属于自己的进程。
 3. **长命令期间持忙锁。** `dsh-proxy -- <命令>` 跑起来时会写 `busy.json`（内容是自己的 PID）并持续续租。只要锁在，`checkIdle()` 一律不动内核 —— 否则一条比 `idleMs` 更久的命令（比如 `npm install`、`git clone`）会在跑到一半时被自己的守护掐断，表现为 `ConnectionReset`。持有者进程若已消失，锁按 PID 自动失效，不会永久卡住。
 4. **命令行守到最后。** 守护定时器是 `unref()` 的（不阻止 Node 退出）。所以 `dsh-proxy start` 与 `dsh-proxy -- <命令>` 都会一直守着，直到内核真的被自动关掉才返回 —— 否则命令一跑完就退出，没人执行「到期杀内核」那一步，内核会一直挂着，正是本插件要消灭的情况。
+
+### 游戏闸门插在哪
+
+闸门只插在**起核路径**上，不影响已在运行的内核：
+
+```
+POST /start ─┐
+POST /fetch ─┼─> ensureAndStart() ─> core.ensureRunning()
+CLI -- cmd  ─┘                            │
+                                          内核已在跑？──是──> 续租返回（不查闸门）
+                                               │否
+                                        gameGate() ──blocked──> 抛 GAME_BLOCKED ─> HTTP 409
+                                               │放行
+                                          core.start()
+```
+
+`gate` 与 `gameWatch` 是用**闭包回调**注入 `core` 的，不是让 `core.js` 直接 `import games.js` —— 这样 `core.js` 只管进程生命周期，判据与设置留在上层，也能被单独测试。
+
+`stopOnGame` 的钩子挂在守护的 `checkIdle()` 里（在忙锁判断之后、租约判断之前）：有命令持锁时绝不关，否则检测到游戏就把内核关掉。
+
+### 礼让闸门插在哪
+
+礼让闸门与游戏闸门是**姊妹机制**，同一个位置、同一个原则（只拦新的、检测失败放行），但**先于游戏闸门判定**：
+
+```
+POST /start ─┐
+POST /fetch ─┼─> ensureAndStart() ─> core.ensureRunning()
+CLI -- cmd  ─┘                            │
+                                          内核已在跑？──是──> 续租返回
+                                               │否
+                                          端口被别人占？──是──> 标记 external 复用，不起内核
+                                               │否
+                                          peerGate() ──blocked──> 抛 PEER_BLOCKED ─> HTTP 409
+                                               │放行
+                                          gameGate() ──blocked──> 抛 GAME_BLOCKED ─> HTTP 409
+                                               │放行
+                                          core.start()
+```
+
+顺序有讲究：**礼让在前**。如果别的代理已经占了端口，「能不能起」这件事根本轮不到游戏状态来回答；先让路可以少探一次系统状态，也让用户看到的被拦原因更准确。
+
+`peerGate` 同样是闭包回调注入 `core`，但签名不同 —— 它接收 `{ ownAlive }`：
+
+```js
+const peerGateFn = ({ ownAlive } = {}) => peerGate({
+  yieldToPeer: user.yieldToPeer !== false,
+  ownPort: user.port,
+  ownAlive: ownAlive === true,
+});
+```
+
+`ownAlive` 必须由 `core` 现算再传下去 —— 上层（`index.js`）拿不到「7890 上的监听是不是我自己」这个判断依据。
 
 ### 内核获取：自包含下载 + 解压
 
@@ -340,6 +536,10 @@ const SEP = '\\\\\\\\?';   // 一个或两个字面反斜杠都认
 - **首次要联网下内核**（约 61MB）。下好之后缓存在 `runtime/`，之后离线可用。
 - **端口被占时不自启。** 这是刻意的：宁可复用别人已经开着的代理，也不去抢端口。
 - **`settings.json` 与 `config.yaml` 分开存。** 换订阅不会丢你的开关和端口设置，但反过来，手动改 `config.yaml` 不会同步进界面显示的「节点数」以外的字段。
+- **游戏检测基于场景推断，不看软件身份。** 这是刻意的（见[游戏检测](#游戏检测)），代价是某些程序的无边框全屏会被误判成游戏。误判只是本次不启动代理，不会影响游戏本身。
+- **探测进程需要 `csc.exe`。** 用的是 Windows 自带的 .NET Framework 编译器（`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`），不需要装 SDK。极端精简的系统上若缺失，闸门会退化成「检测失败 → 放行」。
+- **礼让检测只看端口，不看软件身份。** 也是刻意的（见[礼让其它代理](#礼让其它代理)）。覆盖不到「代理软件开着但还没监听端口」和「TUN 模式不监听端口」两种情况；这种情况下本插件会照常启动，但因为那个代理还在，命令实际走的仍是对方。
+- **只测过 Windows 10/11 x64 + DSH 0.2.0-rc.2。**
 - **不接管系统代理。** 插件只提供本地 HTTP 代理端口，要不要设 `HTTP_PROXY` 是调用方的事。
 
 ## 实现说明
@@ -385,15 +585,29 @@ const path = url.pathname.replace(/^\/dsh-proxy(?=-|\/|$)/, '') || '/';
 
 **https 目标必须先 CONNECT。** 把 https 请求直接打到明文代理端口会失败，报 `Client network socket disconnected before secure TLS connection was established` —— 这不是代理坏了，是用法错了。`lib/index.js` 的 `proxyGet()` 里手写了 CONNECT 隧道。
 
+**常驻子进程会让 Node 不退出。** `lib/probe.js` 起的探测进程持有 stdio 管道，事件循环因此一直非空 —— 短命令（`dsh-proxy game`）跑完却不退出，看起来像卡死。`bin/dsh-proxy.mjs` 在脚本末尾显式 `await disposeProbe()`。
+
+**P/Invoke 三个坑。** 写 `lib/probe.js` 的内嵌 C# 时全踩过：
+
+- `GetMonitorInfoW` / `GetWindowTextW` / `QueryFullProcessImageNameW` **必须**显式写 `EntryPoint = "...W"` 或 `CharSet = CharSet.Unicode` —— 默认会去找 `*A` 版本，而**这些函数根本没有 A 版**，运行时抛 `EntryPointNotFoundException`。
+- 取窗口样式用 `GetWindowLongW`，不是 `GetWindowLongPtrW`。
+- `OpenProcess` 用 `PROCESS_QUERY_LIMITED_INFORMATION (0x1000)` 就能拿进程路径，不需要提升权限。
+
 ## 开发
 
 ```bash
 node --check lib/index.js          # 语法检查
-node test/client-render-test.mjs   # 客户端界面渲染（离线，18 项，不需要内核）
+node test/games-test.mjs           # 游戏判定规则（离线，38 项，纯函数喂构造数据）
+node test/peers-test.mjs           # 礼让判定规则（离线，26 项，纯函数喂构造数据）
+node test/client-render-test.mjs   # 客户端界面渲染（离线，33 项，不需要内核）
 node test/dl-test.mjs              # 只测内核下载（快）
 node test/busy-test.mjs            # 忙锁回归：命令比 idleMs 更久时内核必须活着
 node test/selftest.mjs             # 端到端：导入配置 → 下内核 → 启动 → 出国 → 空闲自关
 ```
+
+`test/games-test.mjs` 之所以能完全离线，是因为判定核心 `evaluateGate()` 被刻意抽成了**纯函数** —— 吃「探测帧」对象、吐结论，不碰真实系统。所以覆盖 explorer 桌面全屏、输入法宿主全屏、探测失败、字段缺失这些边界都不需要真去制造那些场景。
+
+`test/peers-test.mjs` 同理：判定核心 `evaluatePeers()` 也是纯函数，吃构造的端口探测结果。所以「自己的内核占自己的端口不算别人」「同一端口但自己没活那就是别人的」这两个关键分支能精确覆盖，不需要真去起一个假代理。
 
 `test/client-render-test.mjs` 用一个最小 React 替身把 `lib/client.js` 的组件
 在「数据未到位 / 数据到位 / 出错」三种状态下各渲染一遍，**不联网、不下内核**。

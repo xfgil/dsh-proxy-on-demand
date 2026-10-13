@@ -213,7 +213,171 @@ function loadClient(React) {
   });
 }
 
-// ── 5. slot 注入名写错时应能被察觉 ───────────────────────────────────────
+// ── 5. 渲染：游戏检测区块（检测到游戏）───────────────────────────────────
+{
+  const st = {
+    ok: true, enabled: true, coreAlive: false, portUp: false, externalPort: false,
+    pid: null, idleMs: 120000, remainingMs: 0,
+    starts: 0, stops: 0, autoStops: 0, renewals: 0,
+    startedAt: null, lastStartMs: null, lastError: null,
+    plugin: { kernelVersion: '1.19.32', generations: 1, requests: 2, lastError: null },
+    game: {
+      ok: true, blockOnGame: true, stopOnGame: false,
+      gameRunning: true, blocked: true,
+      what: '系统处于「独占全屏」状态（game.exe）',
+      hit: { kind: 'quns', quns: 3, qunsName: '独占全屏', label: 'game.exe' },
+      quns: 3, qunsName: '独占全屏',
+      fg: { name: 'game.exe', path: 'D:\\Games\\SomeGame\\bin\\game.exe' },
+      probeOk: true, probeError: null, probeMs: 1, ms: 1,
+      checkedAt: Date.now(), cached: false,
+    },
+  };
+  const settings = {
+    enabled: true, port: 7890, idleMs: 120000, subscriptionUrl: '',
+    subscriptionIntervalMs: 0, autoImportFlClash: true, configSource: '',
+    lastSyncAt: null, lastSyncNote: '', blockOnGame: true, stopOnGame: false,
+  };
+  const cfgInfo = { exists: true, bytes: 180131, port: 7890, nodeCount: 12, ruleCount: 44, mtime: 1 };
+
+  const React = makeReact([st, settings, cfgInfo, '', null, null, '', '', false]);
+  const cap = loadClient(React);
+  let reg = null;
+  cap.exports.apply({ slots: { inject: (_n, cb) => cb(), register: (o, C) => { reg = { o, C }; return () => {}; } } });
+  const Card = reg.C;
+
+  let tree = null;
+  check('19 游戏检测区块渲染不抛', () => { tree = Card(); assert(tree, '返回空'); });
+  check('20 检测到游戏时显示徽章与原因', () => {
+    const s = textOf(tree);
+    assert(s.includes('游戏检测'), '缺区块标题');
+    assert(s.includes('检测到游戏'), '缺徽章');
+    assert(s.includes('独占全屏'), '缺原因');
+  });
+  check('21 显示系统状态与前台程序', () => {
+    const s = textOf(tree);
+    assert(s.includes('QUNS'), '缺 QUNS 值');
+    assert(s.includes('game.exe'), '缺前台程序名');
+    assert(s.includes('D:\\Games\\SomeGame\\bin\\game.exe'), '缺前台程序路径');
+  });
+  check('22 两个开关文案齐全', () => {
+    const s = textOf(tree);
+    assert(s.includes('游戏运行时禁止启用代理'), '缺主开关');
+    assert(s.includes('检测到游戏就关掉已在运行的代理'), '缺 stopOnGame 开关');
+  });
+  check('23 说明里点明判据不看「是哪个软件」', () => {
+    const s = textOf(tree);
+    assert(s.includes('SHQueryUserNotificationState'), '缺系统 API 说明');
+    assert(s.includes('没有标题栏'), '缺窗口特征说明');
+  });
+  check('24 已删除的白名单/额外游戏区块不再出现', () => {
+    const s = textOf(tree);
+    assert(!s.includes('白名单'), '白名单区块残留');
+    assert(!s.includes('额外识别'), '额外游戏区块残留');
+    assert(!s.includes('内置白名单'), '内置白名单开关残留');
+  });
+}
+
+// ── 6. 渲染：探测不可用时应明说「因此不拦」──────────────────────────────
+{
+  const st = {
+    ok: true, coreAlive: false, portUp: false, pid: null, remainingMs: 0,
+    game: {
+      ok: true, blockOnGame: true, stopOnGame: false,
+      gameRunning: false, blocked: false, what: null, hit: null,
+      quns: null, qunsName: null, fg: null,
+      probeOk: false, probeError: '探测进程未就绪', probeMs: null, ms: 0,
+    },
+  };
+  const settings = { enabled: true, port: 7890, idleMs: 120000, blockOnGame: true, stopOnGame: false };
+  const React = makeReact([st, settings, null, '', null, null, '', '', false]);
+  const cap = loadClient(React);
+  let reg = null;
+  cap.exports.apply({ slots: { inject: (_n, cb) => cb(), register: (o, C) => { reg = { o, C }; return () => {}; } } });
+  const s = textOf(reg.C());
+  check('25 探测不可用时说明原因', () => {
+    assert(s.includes('探测进程未就绪'), '没有显示探测错误');
+  });
+  check('26 探测不可用时明说「不拦」', () => {
+    assert(s.includes('不拦'), '没有说明不拦的后果');
+  });
+}
+
+// ── 7. 渲染：礼让区块（检测到其它代理）──────────────────────────────────
+{
+  const st = {
+    ok: true, enabled: true, coreAlive: false, portUp: true, externalPort: true,
+    pid: null, idleMs: 120000, remainingMs: 0,
+    game: { ok: true, blockOnGame: true, stopOnGame: false, gameRunning: false, probeOk: true, quns: 5, qunsName: '可打扰' },
+    peer: {
+      ok: true, yieldToPeer: true, ownPort: 7890, ownAlive: false,
+      peerRunning: true, blocked: true,
+      what: '端口 7890、10808 正在被监听',
+      hits: [
+        { kind: 'own-port', port: 7890, note: '本插件要用的端口已被别的程序占用' },
+        { kind: 'port', port: 10808, note: '常见代理端口有人监听' },
+      ],
+      probed: 18, ms: 2, checkedAt: Date.now(), cached: false,
+    },
+  };
+  const settings = {
+    enabled: true, port: 7890, idleMs: 120000,
+    blockOnGame: true, stopOnGame: false, yieldToPeer: true,
+  };
+  const React = makeReact([st, settings, null, '', null, null, '', '', false]);
+  const cap = loadClient(React);
+  let reg = null;
+  cap.exports.apply({ slots: { inject: (_n, cb) => cb(), register: (o, C) => { reg = { o, C }; return () => {}; } } });
+  const Card = reg.C;
+
+  let tree = null;
+  check('28 礼让区块渲染不抛', () => { tree = Card(); assert(tree, '返回空'); });
+  check('29 检测到其它代理时显示徽章与端口', () => {
+    const s = textOf(tree);
+    assert(s.includes('其它代理'), '缺区块标题');
+    assert(s.includes('检测到其它代理'), '缺徽章');
+    assert(s.includes('10808'), '缺端口号');
+  });
+  check('30 明说会自动静默让路', () => {
+    const s = textOf(tree);
+    assert(s.includes('自动静默让路'), '没说明让路行为');
+    assert(s.includes('不抢端口'), '没说明不抢端口');
+  });
+  check('31 礼让开关文案齐全', () => {
+    const s = textOf(tree);
+    assert(s.includes('检测到其它代理时自动让路'), '缺礼让开关');
+  });
+  check('32 说明里点明只看端口不看软件名', () => {
+    const s = textOf(tree);
+    assert(s.includes('网络占用'), '缺「只看网络占用」说明');
+    assert(s.includes('不认软件名字'), '缺「不认软件名」说明');
+  });
+}
+
+// ── 8. 渲染：没有其它代理时不显示拦截提示 ────────────────────────────────
+{
+  const st = {
+    ok: true, coreAlive: false, portUp: false, pid: null, remainingMs: 0,
+    peer: {
+      ok: true, yieldToPeer: true, ownPort: 7890, ownAlive: false,
+      peerRunning: false, blocked: false, what: '未检测到其它代理',
+      hits: [], probed: 18, ms: 2, checkedAt: Date.now(), cached: false,
+    },
+  };
+  const settings = { enabled: true, port: 7890, idleMs: 120000, yieldToPeer: true };
+  const React = makeReact([st, settings, null, '', null, null, '', '', false]);
+  const cap = loadClient(React);
+  let reg = null;
+  cap.exports.apply({ slots: { inject: (_n, cb) => cb(), register: (o, C) => { reg = { o, C }; return () => {}; } } });
+  const s = textOf(reg.C());
+  check('33 没有其它代理时显示「没有其它代理」', () => {
+    assert(s.includes('没有其它代理'), '缺正常徽章');
+  });
+  check('34 没有其它代理时不显示让路提示', () => {
+    assert(!s.includes('自动静默让路'), '不该出现拦截提示');
+  });
+}
+
+// ── 9. slot 注入名写错时应能被察觉 ───────────────────────────────────────
 {
   const React = makeReact([]);
   const cap = loadClient(React);
@@ -224,7 +388,7 @@ function loadClient(React) {
       register: () => () => {},
     },
   });
-  check('18 注入的 slot 名不是已废弃的 settings.plugin.item', () => {
+  check('27 注入的 slot 名不是已废弃的 settings.plugin.item', () => {
     assert(injectedName !== 'settings.plugin.item', `仍是废弃名 ${injectedName}`);
   });
 }

@@ -42,6 +42,8 @@ English | [中文](README.md)
 - [Install](#install)
 - [Usage](#usage)
 - [Settings UI](#settings-ui)
+- [Game detection](#game-detection)
+- [Yielding to other proxies](#yielding-to-other-proxies)
 - [Configuration](#configuration)
 - [HTTP API](#http-api)
 - [How it works](#how-it-works)
@@ -67,6 +69,11 @@ It wraps [mihomo](https://github.com/MetaCubeX/mihomo) (the Clash.Meta core):
   kernel and cleans up its state files.
 - **Holds nothing in between** — no resident process, port 7890 is free, and it
   never fights with the Clash/FlClash you run yourself.
+- **No meddling while you game** — a detected fullscreen game keeps the proxy
+  off, leaving your network untouched (see [Game detection](#game-detection)).
+- **Never fights another proxy** — when you already have FlClash or similar
+  running, it silently steps aside and starts no process of its own (see
+  [Yielding to other proxies](#yielding-to-other-proxies)).
 
 ## The problem it actually solves
 
@@ -190,6 +197,7 @@ dsh-proxy prepare                    # download kernel + prepare config
 dsh-proxy import-flclash             # import config from local FlClash
 dsh-proxy start                      # start kernel; waits until it auto-shuts down
 dsh-proxy stop                       # stop immediately
+dsh-proxy game                       # show game-detection result
 dsh-proxy -- <command> [args...]     # run one command through the proxy
 ```
 
@@ -199,7 +207,11 @@ The last form is the common one:
 dsh-proxy -- git clone https://github.com/some/repo
 dsh-proxy --idle 0 -- curl.exe -sS https://api.ipify.org    # shut down right after
 dsh-proxy --idle 600 -- npm install                          # stay up for 10 idle minutes
+dsh-proxy --no-gate -- curl.exe -sS https://api.ipify.org    # skip game detection, force it on
 ```
+
+The CLI is bound by the game gate too (otherwise `dsh-proxy -- ...` would bypass
+the whole protection); when it's blocked the exit code is **3**.
 
 It injects into the child process:
 
@@ -228,6 +240,12 @@ Refreshes every 4 seconds.
 | Import from FlClash | Reads your local FlClash `config.yaml` and rewrites rule-provider absolute paths to relative ones |
 | Paste manually | Drop in a Clash/mihomo YAML directly |
 
+**Game detection** — shows the current system state
+(`SHQueryUserNotificationState`), the foreground program, and whether a game was
+detected; two switches (*block enabling the proxy while a game runs* / *shut the
+running proxy down when a game is detected*) plus a *re-check now* button. See
+[Game detection](#game-detection) for details.
+
 **Parameters** — proxy port, idle timeout (seconds), enable/disable the plugin,
 and whether to auto-import FlClash on first run. Changes apply immediately.
 
@@ -236,6 +254,155 @@ and whether to auto-import FlClash on first run. Changes apply immediately.
 The UI **does not go through DSH's `settings` service**; it reads and writes the
 settings file and talks to the plugin's own HTTP endpoints. See
 [Implementation notes](#implementation-notes) for why.
+
+## Game detection
+
+You don't want your network environment changed while you're gaming, so before
+**starting the kernel** the plugin takes a look at the system state: **if a game
+is detected, the proxy is not enabled**.
+
+### Only manages itself
+
+There's a deliberate decision here: **the criteria never ask "which program is
+this"**.
+
+There is no built-in game list, and no "accelerator whitelist" either — such a
+list can never be exhaustive, and any missing entry would let through exactly the
+scenarios that should be blocked. The criteria ask one thing only: **does this
+situation look like playing a game in fullscreen**.
+
+The price is the occasional false positive (a borderless-fullscreen window taken
+for a game). But the consequence is merely that the proxy plugin doesn't start
+this once; the game itself is untouched — flip the switch off temporarily, or add
+`--no-gate` on the command line, and you're through.
+
+### Two criteria
+
+| Criterion | What it is | Source |
+|---|---|---|
+| **Primary** | system state ∈ {busy, exclusive fullscreen, presentation} | `SHQueryUserNotificationState` |
+| **Secondary** | the foreground window fills a whole monitor **and** has no caption, and is not a shell component | `GetForegroundWindow` + `GetWindowLong` + `MonitorFromWindow` |
+
+What makes the primary criterion meaningful: **Windows itself is saying "don't
+interrupt the user right now"**. Measured, it catches borderless fullscreen (not
+just exclusive D3D fullscreen) — popping a `FormBorderStyle=None` window that
+fills the screen moves QUNS from 5 (accepts notifications) to 2 (busy).
+
+The secondary criterion covers borderless fullscreen the system doesn't report.
+It must exclude shell components or it misfires: measured, with the `explorer.exe`
+desktop pulled to the foreground `caption=false, full=true`, so **the naive
+criterion takes it for a game** — while at that same moment QUNS=5, the system
+plainly saying "interruptible". That is exactly why **QUNS has to be the primary
+criterion**.
+
+`QUNS` values: `1=locked / 2=busy / 3=exclusive fullscreen / 4=presentation / 5=accepts notifications / 6=quiet time / 7=app-defined`. Only `2/3/4` block.
+
+### Blocks only new starts
+
+`ensureRunning()` returns a lease renewal directly when the kernel is already
+running, **without passing through the gate**. So:
+
+- If the proxy is **not running** when a game starts → starting is refused
+  (returns `409 Conflict`).
+- If the proxy is **already running** when a game starts → it's left alone, and
+  the download you have in flight is not interrupted.
+
+To make it "shut the proxy down the moment a game starts", turn on *shut the
+running proxy down when a game is detected* (`stopOnGame`) in Settings.
+
+### Fails open
+
+The probe won't start, compilation fails, it times out — in all those cases the
+gate **lets it through**. Better to let one slip than to have the detection
+machinery itself lock the proxy out for good.
+
+### The probe process
+
+Detection goes through a **resident child process**, `runtime/gameprobe.exe`
+(embedded C# source, compiled with Windows' own `csc.exe` — no SDK needed). The
+protocol is line-delimited JSON over stdin/stdout.
+
+Why keep it resident rather than spawning per call — measured numbers:
+
+| Approach | Cost per call |
+|---|---|
+| `Add-Type` compile every time | 480ms |
+| compile to an exe, spawn per call | 349ms |
+| compile to a DLL + `Assembly.LoadFrom` | 8ms |
+| **resident exe + stdin/stdout** | **0.5ms** (385ms cold start, paid once) |
+
+The UI polls every 4 seconds, and a verdict is cached for 3 seconds — so the real
+system-call rate is about once every 3 seconds.
+
+### Command line
+
+```bash
+dsh-proxy game              # show the detection result: system state, foreground program, time taken
+dsh-proxy game --json       # the same, as JSON
+dsh-proxy --no-gate -- cmd  # skip detection for this run, force it on
+```
+
+When the gate blocks you the CLI exit code is **3** (as opposed to the ordinary
+1), so a script can tell "blocked by a game" from "it genuinely failed".
+
+## Yielding to other proxies
+
+If another proxy is already running on your machine (FlClash, Clash Verge,
+v2rayN…), this plugin **silently steps aside**: it starts no kernel of its own,
+grabs no port and leaves your network environment alone. It recovers
+automatically once that other proxy exits.
+
+### Ports only, not software identity
+
+There is exactly one criterion: **is anyone listening on a common proxy port**.
+
+| | |
+|---|---|
+| Ports probed | 18: `7890-7893` (Clash/mihomo), `7897/7898` (Clash Verge Rev), `10808-10810` (v2rayN/xray), `1080/1081` (the usual SOCKS ports), `2080/2081` (sing-box), `20171/20172` (older Clash Verge), `8889` (Clash for Windows), `8118` (privoxy), `9910`, plus this plugin's own port |
+| Cost | about **2–3ms** for the whole concurrent probe (a connection refused on loopback is instantaneous) |
+
+Why not look at process names: this way it applies to any proxy software
+automatically, needs no maintained list of "who counts as a proxy", and can't miss
+one just because it isn't on the list. The price is two uncovered cases — proxy
+software that is open but hasn't started listening on a port yet, and TUN mode,
+which doesn't listen on a port at all. In those two cases this plugin starts as
+usual, but since that other proxy is still there, your commands actually keep
+going through it (see "Reuse when the port is taken" below).
+
+### Must exclude your own kernel
+
+This plugin listens on `port` itself (7890 by default). If detection didn't
+exclude itself, the kernel would be taken for "another proxy" the moment it came
+up and would then **block itself forever**.
+
+So the verdict carries one hard rule: `port === ownPort && our own kernel is
+alive` → not someone else. `ownAlive` is computed by `core` and handed upward —
+because "is the listener on this port me" is something only core knows.
+
+### Reuse when the port is taken, block only when it is free
+
+The gate only needs to speak up when we are **about to start our own kernel**. If
+7890 is already taken by someone else, `ensureRunning()` simply marks
+`external: true` and returns: commands work as usual (through the proxy that
+someone else already built), and we start not a single process. That is what
+"silently steps aside" looks like on the normal path.
+
+### Fails open
+
+Same principle as the game gate: when probing errors out, let it through — better
+to start a kernel one extra time than to have a bug in the probing code make the
+proxy unusable for good.
+
+### Command line
+
+```bash
+dsh-proxy peers              # show the detection result: which ports are taken, time taken
+dsh-proxy peers --json       # the same, as JSON
+dsh-proxy --no-peer -- cmd   # skip yielding for this run, force it on
+```
+
+When the peer gate blocks you the CLI exit code is **4** (the game gate is 3, an
+ordinary error is 1).
 
 ## Configuration
 
@@ -250,9 +417,17 @@ The plugin's own settings live in `<plugin>/runtime/settings.json`:
   "autoImportFlClash": true,
   "configSource": "flclash",
   "lastSyncAt": 1760000000000,
-  "lastSyncNote": "已从 FlClash 导入（规则 44 条）"
+  "lastSyncNote": "已从 FlClash 导入（规则 44 条）",
+  "blockOnGame": true,
+  "stopOnGame": false,
+  "yieldToPeer": true
 }
 ```
+
+`blockOnGame` defaults to `true` (block enabling the proxy while a game runs),
+`stopOnGame` defaults to `false` (block new starts only; leave a running kernel
+alone), `yieldToPeer` defaults to `true` (step aside automatically when another
+proxy is detected).
 
 The `runtime/` directory (excluded by `.gitignore`) holds runtime artifacts:
 
@@ -265,6 +440,7 @@ The `runtime/` directory (excluded by `.gitignore`) holds runtime artifacts:
 | `core.pid` | PID of the current kernel (used only to kill our own) |
 | `lease.json` | the lease — "in use until" |
 | `busy.json` | the busy lock — "which long command is using it" (liveness by PID) |
+| `gameprobe.exe` / `gameprobe.cs` | the resident probe process for game detection (compiled on first use) |
 | `core.log` | kernel log |
 
 ## HTTP API
@@ -285,6 +461,33 @@ Everything listens on **loopback only** (`127.0.0.1` / `::1`); other origins get
 | POST | `/dsh-proxy/config/manual` | `{"text":"..."}` — write a config by hand |
 | GET | `/dsh-proxy/config/example` | get a template |
 | POST | `/dsh-proxy/fetch` | `{"url":"https://..."}` — fetch once through the proxy |
+| GET | `/dsh-proxy/game` | game-detection status (add `?force=1` to bypass the cache) |
+| POST | `/dsh-proxy/game/clear-cache` | clear the detection cache and re-check |
+| GET | `/dsh-proxy/peers` | peer-yield detection status (add `?force=1` to bypass the cache) |
+| POST | `/dsh-proxy/peers/clear-cache` | clear the peer-yield detection cache and re-check |
+
+When the game gate blocks you, `POST /start` and `POST /fetch` return
+**409 Conflict**:
+
+```json
+{
+  "ok": false,
+  "blocked": true,
+  "reason": "game-running",
+  "error": "系统处于「忙碌」状态（game.exe），已按设置禁止启用代理。…"
+}
+```
+
+Blocked by the peer gate it's a 409 as well, with `reason` set to `peer-running`:
+
+```json
+{
+  "ok": false,
+  "blocked": true,
+  "reason": "peer-running",
+  "error": "检测到其它代理正在运行（端口 10808 正在被监听），已按设置自动静默让路，不启动本插件的内核。…"
+}
+```
 
 ## How it works
 
@@ -322,6 +525,71 @@ Four deliberate decisions:
    foreground until the kernel is actually auto-shut-down — otherwise the command
    would exit and nobody would be left to run the "kill on expiry" step, leaving
    the kernel running, which is exactly what this plugin exists to prevent.
+
+### Where the gate hooks in
+
+The gate hooks into the **kernel-start path** only; it never touches a kernel
+that's already running:
+
+```
+POST /start ─┐
+POST /fetch ─┼─> ensureAndStart() ─> core.ensureRunning()
+CLI -- cmd  ─┘                            │
+                                          kernel already running? ──yes──> renew lease and return (gate not consulted)
+                                               │no
+                                        gameGate() ──blocked──> throw GAME_BLOCKED ─> HTTP 409
+                                               │allowed
+                                          core.start()
+```
+
+`gate` and `gameWatch` are injected into `core` as **closure callbacks**, rather
+than having `core.js` `import games.js` directly — that way `core.js` only deals
+with process lifecycle, while the criteria and settings stay in the layer above,
+and can be tested on their own.
+
+The `stopOnGame` hook hangs off the guard's `checkIdle()` (after the busy-lock
+check, before the lease check): while a command holds the lock it never shuts
+down; otherwise a detected game takes the kernel down.
+
+### Where the peer gate hooks in
+
+The peer gate is a **sister mechanism** to the game gate — same position, same
+principle (block new starts only, fail open), but it **decides before the game
+gate does**:
+
+```
+POST /start ─┐
+POST /fetch ─┼─> ensureAndStart() ─> core.ensureRunning()
+CLI -- cmd  ─┘                            │
+                                          kernel already running? ──yes──> renew lease and return
+                                               │no
+                                          port taken by someone else? ──yes──> mark external, reuse it, start no kernel
+                                               │no
+                                          peerGate() ──blocked──> throw PEER_BLOCKED ─> HTTP 409
+                                               │allowed
+                                          gameGate() ──blocked──> throw GAME_BLOCKED ─> HTTP 409
+                                               │allowed
+                                          core.start()
+```
+
+The order matters: **yielding comes first**. If another proxy already holds the
+port, then "can we even start" is not a question the game state gets to answer;
+stepping aside first saves one system-state probe and makes the block reason the
+user sees more accurate.
+
+`peerGate` is likewise injected into `core` as a closure callback, but with a
+different signature — it receives `{ ownAlive }`:
+
+```js
+const peerGateFn = ({ ownAlive } = {}) => peerGate({
+  yieldToPeer: user.yieldToPeer !== false,
+  ownPort: user.port,
+  ownAlive: ownAlive === true,
+});
+```
+
+`ownAlive` has to be computed by `core` at that moment and passed down — the layer
+above (`index.js`) has no way to know whether the listener on 7890 is itself.
 
 ### Kernel acquisition: self-contained download + unzip
 
@@ -401,6 +669,22 @@ redistribute this plugin, note that **downloading** a GPL-3.0 program and
 - **`settings.json` and `config.yaml` are stored separately.** Changing the
   subscription won't lose your switches and port settings; conversely, editing
   `config.yaml` by hand won't sync into the UI beyond the node count.
+- **Game detection infers from the situation, not the software's identity.** This
+  is deliberate (see [Game detection](#game-detection)); the price is that some
+  programs' borderless fullscreen gets taken for a game. A false positive only
+  means the proxy doesn't start this once, and never affects the game itself.
+- **The probe process needs `csc.exe`.** It uses the .NET Framework compiler that
+  ships with Windows
+  (`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`) — no SDK required.
+  On an extremely stripped-down system where it's missing, the gate degrades to
+  "detection failed → let it through".
+- **Peer detection looks at ports only, not software identity.** Also deliberate
+  (see [Yielding to other proxies](#yielding-to-other-proxies)). It doesn't cover
+  the two cases of "proxy software is open but not listening on a port yet" and
+  "TUN mode, which listens on no port"; in those cases this plugin starts as usual,
+  but since that other proxy is still there, your commands actually keep going
+  through it.
+- **Only tested on Windows 10/11 x64 + DSH 0.2.0-rc.2.**
 - **It does not take over the system proxy.** The plugin only exposes a local HTTP
   proxy port; setting `HTTP_PROXY` is the caller's business.
 
@@ -476,15 +760,44 @@ plaintext proxy port fails with `Client network socket disconnected before secur
 TLS connection was established` — that's a usage error, not a broken proxy.
 `proxyGet()` in `lib/index.js` implements the CONNECT tunnel by hand.
 
+**A resident child process keeps Node from exiting.** The probe process started by
+`lib/probe.js` holds the stdio pipes, so the event loop never empties — a short
+command (`dsh-proxy game`) finishes but doesn't exit, looking like a hang.
+`bin/dsh-proxy.mjs` explicitly `await disposeProbe()`s at the end of the script.
+
+**Three P/Invoke traps.** All hit while writing the embedded C# in `lib/probe.js`:
+
+- `GetMonitorInfoW` / `GetWindowTextW` / `QueryFullProcessImageNameW` **must**
+  spell out `EntryPoint = "...W"` or `CharSet = CharSet.Unicode` — the default
+  looks for the `*A` versions, and **these functions have no A version at all**,
+  so it throws `EntryPointNotFoundException` at runtime.
+- Read window styles with `GetWindowLongW`, not `GetWindowLongPtrW`.
+- `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION (0x1000)` is enough to get
+  the process path, no elevation required.
+
 ## Development
 
 ```bash
 node --check lib/index.js          # syntax check
-node test/client-render-test.mjs   # client UI rendering (offline, 18 checks, no kernel needed)
+node test/games-test.mjs           # game-detection rules (offline, 38 checks, pure function fed fixture data)
+node test/peers-test.mjs           # peer-yield rules (offline, 26 checks, pure function fed fixture data)
+node test/client-render-test.mjs   # client UI rendering (offline, 33 checks, no kernel needed)
 node test/dl-test.mjs              # kernel download only (fast)
 node test/busy-test.mjs            # busy-lock regression: kernel must survive a command longer than idleMs
 node test/selftest.mjs             # end-to-end: import config → download → start → go abroad → idle shutdown
 ```
+
+`test/games-test.mjs` manages to be fully offline because the decision core,
+`evaluateGate()`, was deliberately factored out as a **pure function** — it takes
+a "probe frame" object and returns a verdict, never touching the real system. So
+covering edges like a fullscreen explorer desktop, a fullscreen IME host, a failed
+probe or missing fields needs none of those situations to actually be staged.
+
+`test/peers-test.mjs` works the same way: its decision core, `evaluatePeers()`, is
+a pure function fed constructed port-probe results. So the two key branches — "a
+listener on our own port held by our own kernel doesn't count as someone else"
+and "the same port, but we're not alive, so it is someone else" — are covered
+exactly, with no need to actually stand up a fake proxy.
 
 `test/client-render-test.mjs` renders `lib/client.js`'s component through a minimal
 React stand-in in three states — data not yet loaded, data loaded, and errored —
