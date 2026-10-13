@@ -1,0 +1,14 @@
+node_modules/
+
+# 运行时产物：内核二进制、生成的配置、规则文件、租约与状态
+runtime/
+
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.bak
+*.bak-*
+*.tmp
