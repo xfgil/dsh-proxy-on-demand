@@ -17,12 +17,14 @@
 import { promises as fsp } from 'node:fs';
 import { existsSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { createServer as createNetServer } from 'node:net';
 
 import { materialize, findFlClashConfig, forceExternalController, forceDnsPort, readExternalController } from '../lib/config.js';
 import { ensureKernel, latestVersion } from '../lib/downloader.js';
 import { ProxyCore } from '../lib/core.js';
-import { countProxies, countRules, configSummary } from '../lib/settings.js';
+import { countProxies, countRules, configSummary, writeManualConfig } from '../lib/settings.js';
 import { listProxies, testConnectivity, sampleActivity } from '../lib/nodes.js';
+import { buildRestoreScript } from '../lib/systemproxy.js';
 
 const RUNTIME = 'C:\\Users\\暝\\AppData\\Local\\Temp\\dsh-proxy-selftest';
 /** 管理 API 端口与密钥（自测专用；真实运行由 index.js 动态分配）。 */
@@ -53,6 +55,48 @@ await fsp.mkdir(join(RUNTIME, 'providers', 'rules'), { recursive: true });
 if (existsSync(STASH)) await fsp.copyFile(STASH, KERNEL_EXE);
 
 try {
+  // 0. 纯离线：系统代理「还原脚本」的防线（只拼字符串，**不碰注册表**）
+  //
+  // 2026-10-13 真实事故：用户自定的 17 项绕过列表
+  // （`*zhihu.com;*zhimg.com;*jd.com;...`，与 FlClash shared_preferences 里的
+  //  bypassDomain 完全一致）被抹成了空。成因是**备份基线本身已被污染** ——
+  //  备份里 `override` 就是空，于是每次「精确还原」都把空值写回去；而验证脚本
+  //  逐字段比对备份与还原结果，两边都是空，反而**全部通过**，把问题掩盖了。
+  //
+  // 所以这里锁死一条规则：**空 override 绝不主动写回**。宁可留下我们写的自环
+  // 保护项，也绝不把用户的绕过列表抹掉。断言直接查生成的脚本文本，
+  // 比拿真注册表做实验安全得多。
+  {
+    const withOv = buildRestoreScript({
+      enable: 1, server: 'x:1', override: 'a;b', autoConfig: '',
+    });
+    check('0a 非空绕过列表照常写回',
+      withOv.includes("Set-ItemProperty -Path $k -Name ProxyOverride -Value 'a;b'"), '');
+
+    const emptyOv = buildRestoreScript({
+      enable: 1, server: 'x:1', override: '', overrideExisted: true, autoConfig: '',
+    });
+    check('0b 空绕过列表绝不写回（保留现值）',
+      !emptyOv.includes('Set-ItemProperty -Path $k -Name ProxyOverride'),
+      '备份被污染时不该拿空值覆盖用户的绕过列表');
+
+    const neverHad = buildRestoreScript({
+      enable: 1, server: 'x:1', override: '', overrideExisted: false, autoConfig: '',
+    });
+    check('0c 原本就没有该值时才删除它',
+      neverHad.includes('Remove-ItemProperty -Path $k -Name ProxyOverride'), '');
+
+    const legacy = buildRestoreScript({ enable: 0, server: '', override: '', autoConfig: '' });
+    check('0d 老备份（无 overrideExisted 字段）既不写也不删',
+      !legacy.includes('Set-ItemProperty -Path $k -Name ProxyOverride')
+      && !legacy.includes('Remove-ItemProperty -Path $k -Name ProxyOverride'), '');
+
+    check('0e 跳过绕过列表不影响其余字段照常还原',
+      legacy.includes('-Value 0 -Type DWord')
+      && legacy.includes('ProxyServer')
+      && legacy.includes('AutoConfigURL'), '');
+  }
+
   // 1. 找 FlClash 配置
   const found = await findFlClashConfig();
   check('1 找到本机 FlClash 配置', found.found, found.path ?? '');
@@ -152,23 +196,74 @@ try {
     check('2o DNS listen 被改写', /^\s+listen: 127\.0\.0\.1:\d+$/m.test(dnsOut.text), dnsOut.text.split('\n').find((l) => /listen:/.test(l)) ?? '');
     check('2o2 DNS 没被插到文件开头', !/^dns:|^  listen:/.test(dnsOut.text.split('\n')[0]), dnsOut.text.split('\n')[0]);
     check('2o3 store-selected 被打开', /store-selected:\s*true/.test(t), '');
+
+    // ── 2p/2q：另外两条写配置入口必须与 materialize 做同款修补 ──────────────
+    //
+    // 2026-10-13 漏过一次：`applySubscription` / `writeManualConfig` 只补了管理
+    // API，忘了 DNS 端口 —— 走订阅或手贴配置的用户照样会撞上「1053 被 FlClash
+    // 占着 → 内核 DNS 起不来 → 测速全超时」。
+    // 2p 锁住修补生效，2q 锁住**没顺手篡改用户的测速目标**（那次误判的另一半）。
+    {
+      const dir = join(RUNTIME, 'manual-probe');
+      await fsp.mkdir(dir, { recursive: true });
+      // ⚠️ 冲突要**自己造**，不能指望环境里正好有人占着 1053。
+      //
+      // 这条断言原来写的是「m.dnsPort !== 1053」，直接假定 1053 被 FlClash
+      // 占着。可 FlClash 一关、插件内核一停，1053 就是空闲的 —— 此时
+      // pickFreePort(1053) 合法地返回 1053，断言就假失败（2026-10-13 实测
+      // 39/40 就是这么来的）。「避开冲突」这件事只有在**冲突存在**时才可判，
+      // 所以这里先自己绑一个 TCP 监听占住 1053，再验插件会让开。
+      const squatter = createNetServer();
+      const squatting = await new Promise((resolve) => {
+        squatter.once('error', () => resolve(false));          // 已被别人占着更好，同样构成冲突
+        squatter.listen(1053, '127.0.0.1', () => resolve(true));
+      });
+      let m = null;
+      let mt = '';
+      try {
+        m = await writeManualConfig(dir, t);
+        mt = await fsp.readFile(join(dir, 'config.yaml'), 'utf8');
+      } finally {
+        if (squatting) await new Promise((r) => squatter.close(r));
+        else squatter.close();
+      }
+      const mListen = mt.split('\n').find((l, i) => /^\s+listen:/.test(l) && mt.split('\n').slice(0, i).some((x) => /^dns:\s*$/.test(x))) ?? '';
+      check('2p 手动粘贴的配置也避开 DNS 端口冲突', /listen: 127\.0\.0\.1:\d+/.test(mListen) && m?.dnsPort !== 1053, `${mListen.trim()} (dnsPort=${m?.dnsPort}${squatting ? '，1053 由本测试占着' : '，1053 本来就被占着'})`);
+      const gSrc = (t.match(/www\.gstatic\.com\/generate_204/g) || []).length;
+      const gOut = (mt.match(/www\.gstatic\.com\/generate_204/g) || []).length;
+      check('2q 没有篡改用户配置里的测速目标', gSrc === gOut, `${gSrc} 处 → ${gOut} 处`);
+    }
   }
 
-  // 3. 下载内核
-  const tmpEnv = process.env;
-  const tag = await latestVersion('https://api.github.com/repos/MetaCubeX/mihomo/releases/latest');
-  check('3 取到最新内核版本', !!tag, tag ?? '');
-  const ver = tag.startsWith('v') ? tag : `v${tag}`;
-  const k = await ensureKernel({
-    dir: RUNTIME,
-    url: `https://github.com/MetaCubeX/mihomo/releases/download/${ver}/mihomo-windows-amd64-${ver}.zip`,
-    entry: 'mihomo-windows-amd64.exe',
-    exe: 'mihomo.exe',
-    // 打印走的哪个源 —— 下载失败时这是唯一能看出"卡在哪一步"的线索
-    // （之前它只报一句 "aborted"，完全无法定位）。
-    onLog: (m) => console.log(`   [dl] ${m}`),
-  });
-  check('3b 内核下载并解压成功', k.ok && k.bytes > 20e6, `${Math.round(k.bytes / 1e6)}MB`);
+  // 3. 内核可执行文件就位（**缓存优先，不联网**）
+  //
+  // 原来是「先调 latestVersion() 查 GitHub API，再 ensureKernel()」，于是整个
+  // 自测被绑死在 GitHub 连通性上：直连超时、镜像抽风、**未认证 api.github.com
+  // 配额用尽（60 次/小时 —— 排查期间反复重跑必然触发，表现为所有源一起 403）**，
+  // 任何一条都会让自测在第 3 步抛 `FAIL EXCEPTION`，而插件代码本身毫无问题。
+  //
+  // 内核是下载产物、与插件逻辑无关，没理由每轮都去问一次版本。已缓存就直接用；
+  // 只有缓存真的缺失时才联网，那时才需要版本号。
+  const kernelPath = join(RUNTIME, 'mihomo.exe');
+  const cachedBytes = existsSync(kernelPath) ? (await fsp.stat(kernelPath)).size : 0;
+  if (cachedBytes > 20e6) {
+    check('3 复用已缓存的内核（不联网）', true, `${Math.round(cachedBytes / 1e6)}MB`);
+    check('3b 内核可执行文件已就位', true, `${Math.round(cachedBytes / 1e6)}MB`);
+  } else {
+    const tag = await latestVersion('https://api.github.com/repos/MetaCubeX/mihomo/releases/latest');
+    check('3 取到最新内核版本', !!tag, tag ?? '');
+    const ver = tag.startsWith('v') ? tag : `v${tag}`;
+    const k = await ensureKernel({
+      dir: RUNTIME,
+      url: `https://github.com/MetaCubeX/mihomo/releases/download/${ver}/mihomo-windows-amd64-${ver}.zip`,
+      entry: 'mihomo-windows-amd64.exe',
+      exe: 'mihomo.exe',
+      // 打印走的哪个源 —— 下载失败时这是唯一能看出"卡在哪一步"的线索
+      // （之前它只报一句 "aborted"，完全无法定位）。
+      onLog: (m) => console.log(`   [dl] ${m}`),
+    });
+    check('3b 内核下载并解压成功', k.ok && k.bytes > 20e6, `${Math.round(k.bytes / 1e6)}MB`);
+  }
 
   // 4. 拉起内核（用 7891 避开可能占用的 7890）
   const port = 7891;
