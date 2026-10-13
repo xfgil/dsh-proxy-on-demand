@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { materialize, findFlClashConfig } from '../lib/config.js';
 import { ensureKernel, latestVersion } from '../lib/downloader.js';
 import { ProxyCore } from '../lib/core.js';
+import { countProxies, countRules, configSummary } from '../lib/settings.js';
 
 const RUNTIME = 'C:\\Users\\暝\\AppData\\Local\\Temp\\dsh-proxy-selftest';
 const results = [];
@@ -43,6 +44,47 @@ try {
   const remaining = (cfgText.match(/C:\\+Users/gi) || []).length;
   const relative = (cfgText.match(/providers\/rules\//g) || []).length;
   check('2b 绝对路径已全部改为相对路径', remaining === 0, `残留 ${remaining} 处`);
+
+  // ── 2e/2f：节点数与规则数必须数得出来 ─────────────────────────────────────
+  //
+  // 这一节是 2026-10-13 事故的回归锁。原实现只认「`- ` 后紧跟 `name:`」和
+  // 「`- ` 后紧跟规则类型」，而 mihomo / FlClash 写的是**规范化输出**：
+  // 节点键按字母序重排（`hop-interval` 排在 `name` 前），规则条目带引号。
+  // 结果两个计数**恒为 0** —— 界面显示「0 个节点」，用户看到的就是
+  // 「节点根本导入不进去」，尽管 config.yaml 里明明有 143 个节点。
+  {
+    const summary = await configSummary(RUNTIME);
+    check('2e 从真实 FlClash 配置数出节点数', summary.nodeCount > 0, `${summary.nodeCount} 个节点`);
+    check('2f 从真实 FlClash 配置数出规则数', summary.ruleCount > 0, `${summary.ruleCount} 条规则`);
+
+    // 规范化输出（键序打乱 + 规则带引号）也必须数对。
+    const normalized = [
+      'mixed-port: 7890',
+      'proxies:',
+      '  - hop-interval: 30',
+      '    name: "节点甲"',
+      '    server: 1.2.3.4',
+      '    type: hysteria2',
+      '  - name: "节点乙"',
+      '    server: 5.6.7.8',
+      '    type: trojan',
+      '  - {name: "节点丙", server: 9.9.9.9, type: ss}',
+      'proxy-groups:',
+      '  - name: PROXY',
+      '    type: select',
+      'rules:',
+      '  - "DOMAIN-SUFFIX,zoom.com.cn,DIRECT"',
+      '  - DOMAIN,example.com,PROXY',
+      '  - "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT"',
+      '  - MATCH,PROXY',
+      '',
+    ].join('\n');
+    check('2g 键序打乱时仍数得对节点', countProxies(normalized) === 3, `得到 ${countProxies(normalized)}`);
+    check('2h 规则带引号时仍数得对', countRules(normalized) === 4, `得到 ${countRules(normalized)}`);
+    // 反例：没有 proxies: 段时必须是 0（别把 proxy-groups 的条目算进去）
+    check('2i 没有 proxies 段 → 0', countProxies('mixed-port: 7890\nrules:\n  - MATCH,DIRECT\n') === 0);
+    check('2j 没有 rules 段 → 0', countRules('mixed-port: 7890\nproxies:\n  - name: a\n') === 0);
+  }
   check('2c 相对路径已写入', relative === r.rulesTotal, `${relative}/${r.rulesTotal}`);
   check('2d 规则文件已拷贝到位', existsSync(join(RUNTIME, 'providers', 'rules')), '');
 
