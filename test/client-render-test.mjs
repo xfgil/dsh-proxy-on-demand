@@ -73,7 +73,10 @@ function textOf(node) {
   if (node.$$typeof === 'element') {
     const t = node.type;
     if (typeof t === 'function') return textOf(t(node.props));
-    return textOf(node.props.children);
+    // 输入框的 placeholder 与按钮上的文字一样是用户看得见的，算进文本
+    const ph = node.props?.placeholder;
+    const kids = textOf(node.props.children);
+    return ph ? `${kids} ${ph}` : kids;
   }
   return '';
 }
@@ -269,11 +272,51 @@ function loadClient(React) {
     assert(s.includes('SHQueryUserNotificationState'), '缺系统 API 说明');
     assert(s.includes('没有标题栏'), '缺窗口特征说明');
   });
-  check('24 已删除的白名单/额外游戏区块不再出现', () => {
+  check('24 用户白名单区块在，且不预置任何名单', () => {
     const s = textOf(tree);
-    assert(!s.includes('白名单'), '白名单区块残留');
+    // 用户明确要求保留「自行添加白名单」，所以区块必须在
+    assert(s.includes('白名单'), '缺白名单区块');
+    assert(s.includes('这些程序不算游戏'), '缺白名单标题');
+    // 但**内置名单**必须是删掉的（用户要求「只管自己」）
     assert(!s.includes('额外识别'), '额外游戏区块残留');
     assert(!s.includes('内置白名单'), '内置白名单开关残留');
+    assert(s.includes('不预置任何名单'), '没有说明白名单由用户自填');
+  });
+  check('24b 白名单区块含输入框与加入按钮', () => {
+    const s = textOf(tree);
+    assert(s.includes('加入'), '缺「加入」按钮');
+    assert(s.includes('进程名或完整路径'), '缺输入框占位文案');
+  });
+  check('24c 白名单为空时明说为空', () => {
+    const s = textOf(tree);
+    assert(s.includes('白名单为空'), '没有显示「白名单为空」');
+  });
+  check('24d 白名单非空时逐条列出并可移除', () => {
+    // 换一份带白名单的状态再渲染一次
+    const st2 = JSON.parse(JSON.stringify(st));
+    st2.game.allow = ['obs64.exe', 'D:\\path\\to\\OBS\\obs64.exe'];
+    const React2 = makeReact([st2, settings, cfgInfo, '', null, null, '', '', false]);
+    const cap2 = loadClient(React2);
+    let reg2 = null;
+    cap2.exports.apply({ slots: { inject: (_n, cb) => cb(), register: (o, C) => { reg2 = { o, C }; return () => {}; } } });
+    const s2 = textOf(reg2.C());
+    assert(s2.includes('obs64.exe'), '缺白名单条目');
+    assert(s2.includes('D:\\path\\to\\OBS\\obs64.exe'), '缺路径条目');
+    assert(s2.includes('移除'), '缺移除按钮');
+  });
+  check('24e 命中白名单时说明为何这次不拦', () => {
+    const st3 = JSON.parse(JSON.stringify(st));
+    st3.game.allow = ['obs64.exe'];
+    st3.game.allowHit = 'name';
+    st3.game.allowed = true;
+    st3.game.gameRunning = false;
+    const React3 = makeReact([st3, settings, cfgInfo, '', null, null, '', '', false]);
+    const cap3 = loadClient(React3);
+    let reg3 = null;
+    cap3.exports.apply({ slots: { inject: (_n, cb) => cb(), register: (o, C) => { reg3 = { o, C }; return () => {}; } } });
+    const s3 = textOf(reg3.C());
+    assert(s3.includes('命中白名单'), '没有说明命中白名单');
+    assert(s3.includes('不拦'), '没有说明因此不拦');
   });
 }
 

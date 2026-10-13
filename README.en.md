@@ -266,15 +266,39 @@ is detected, the proxy is not enabled**.
 There's a deliberate decision here: **the criteria never ask "which program is
 this"**.
 
-There is no built-in game list, and no "accelerator whitelist" either — such a
-list can never be exhaustive, and any missing entry would let through exactly the
-scenarios that should be blocked. The criteria ask one thing only: **does this
-situation look like playing a game in fullscreen**.
+There is no built-in game list, and no built-in accelerator whitelist either —
+such a list can never be exhaustive, and any missing entry would let through
+exactly the scenarios that should be blocked. The criteria ask one thing only:
+**does this situation look like playing a game in fullscreen**.
 
 The price is the occasional false positive (a borderless-fullscreen window taken
 for a game). But the consequence is merely that the proxy plugin doesn't start
-this once; the game itself is untouched — flip the switch off temporarily, or add
-`--no-gate` on the command line, and you're through.
+this once; the game itself is untouched — flip the switch off temporarily, add
+the program to the whitelist, or add `--no-gate` on the command line, and you're
+through.
+
+### Whitelist (filled in by you)
+
+What's above means **the plugin preloads no list of its own**. But you may well
+need exceptions yourself (say a remote-control tool, a screen recorder, or a
+borderless video player gets taken for a game in fullscreen), so there is a
+**user whitelist** — **empty by default, filled in only by you**.
+
+| How to fill it | How it matches |
+|---|---|
+| `obs64.exe` | by **process name**, case-insensitive |
+| `D:\path\to\OBS\obs64.exe` | by **full path** (forward slashes work too, case-insensitive) |
+
+Filling in the name is more durable (the name usually survives an upgrade that
+moves the program to a new directory), at the cost of **letting through every
+program with that name, whatever directory it lives in**; filling in the full
+path lets through only that one, but stops working once the path changes. Mixing
+the two is fine.
+
+When the whitelist hit is the **current foreground program**, neither criterion
+applies. The *add the current foreground program* button in the UI takes the
+foreground window as of the moment it probes — the easiest thing to click when a
+fullscreen window is misjudged.
 
 ### Two criteria
 
@@ -337,9 +361,13 @@ system-call rate is about once every 3 seconds.
 ### Command line
 
 ```bash
-dsh-proxy game              # show the detection result: system state, foreground program, time taken
-dsh-proxy game --json       # the same, as JSON
-dsh-proxy --no-gate -- cmd  # skip detection for this run, force it on
+dsh-proxy game                        # show the detection result: system state, foreground program, time taken
+dsh-proxy game --json                 # the same, as JSON
+dsh-proxy game list                   # list the whitelist
+dsh-proxy game allow obs64.exe        # add a program to the whitelist (for false positives)
+dsh-proxy game --allow-fg             # add the current foreground program to the whitelist
+dsh-proxy game unallow obs64.exe      # remove a program from the whitelist
+dsh-proxy --no-gate -- cmd            # skip detection for this run, force it on
 ```
 
 When the gate blocks you the CLI exit code is **3** (as opposed to the ordinary
@@ -420,14 +448,16 @@ The plugin's own settings live in `<plugin>/runtime/settings.json`:
   "lastSyncNote": "已从 FlClash 导入（规则 44 条）",
   "blockOnGame": true,
   "stopOnGame": false,
+  "gameAllow": ["obs64.exe", "D:\\path\\to\\OBS\\obs64.exe"],
   "yieldToPeer": true
 }
 ```
 
 `blockOnGame` defaults to `true` (block enabling the proxy while a game runs),
 `stopOnGame` defaults to `false` (block new starts only; leave a running kernel
-alone), `yieldToPeer` defaults to `true` (step aside automatically when another
-proxy is detected).
+alone), `gameAllow` defaults to `[]` (the whitelist is filled in by the user
+alone; the plugin preloads nothing), `yieldToPeer` defaults to `true` (step aside
+automatically when another proxy is detected).
 
 The `runtime/` directory (excluded by `.gitignore`) holds runtime artifacts:
 
@@ -463,6 +493,8 @@ Everything listens on **loopback only** (`127.0.0.1` / `::1`); other origins get
 | POST | `/dsh-proxy/fetch` | `{"url":"https://..."}` — fetch once through the proxy |
 | GET | `/dsh-proxy/game` | game-detection status (add `?force=1` to bypass the cache) |
 | POST | `/dsh-proxy/game/clear-cache` | clear the detection cache and re-check |
+| POST | `/dsh-proxy/game/allow` | add a whitelist entry; with no argument it takes the **current foreground program** |
+| POST | `/dsh-proxy/game/allow/remove` | `{"entry":"..."}` — remove an entry from the whitelist |
 | GET | `/dsh-proxy/peers` | peer-yield detection status (add `?force=1` to bypass the cache) |
 | POST | `/dsh-proxy/peers/clear-cache` | clear the peer-yield detection cache and re-check |
 
@@ -546,6 +578,11 @@ CLI -- cmd  ─┘                            │
 than having `core.js` `import games.js` directly — that way `core.js` only deals
 with process lifecycle, while the criteria and settings stay in the layer above,
 and can be tested on their own.
+
+The whitelist takes effect inside `evaluateGate()`: on a hit **neither criterion
+participates** (`hit` is simply `null`), rather than "decide first, then undo".
+That way there is only one explanation for "why wasn't this blocked", and the UI
+can tell you plainly whether the name or the path matched.
 
 The `stopOnGame` hook hangs off the guard's `checkIdle()` (after the busy-lock
 check, before the lease check): while a command holds the lock it never shuts
@@ -672,7 +709,9 @@ redistribute this plugin, note that **downloading** a GPL-3.0 program and
 - **Game detection infers from the situation, not the software's identity.** This
   is deliberate (see [Game detection](#game-detection)); the price is that some
   programs' borderless fullscreen gets taken for a game. A false positive only
-  means the proxy doesn't start this once, and never affects the game itself.
+  means the proxy doesn't start this once, and never affects the game itself; you
+  can also add that program to the
+  [whitelist](#whitelist-filled-in-by-you).
 - **The probe process needs `csc.exe`.** It uses the .NET Framework compiler that
   ships with Windows
   (`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`) — no SDK required.
@@ -779,9 +818,9 @@ command (`dsh-proxy game`) finishes but doesn't exit, looking like a hang.
 
 ```bash
 node --check lib/index.js          # syntax check
-node test/games-test.mjs           # game-detection rules (offline, 38 checks, pure function fed fixture data)
+node test/games-test.mjs           # game-detection rules (offline, 61 checks, pure function fed fixture data)
 node test/peers-test.mjs           # peer-yield rules (offline, 26 checks, pure function fed fixture data)
-node test/client-render-test.mjs   # client UI rendering (offline, 33 checks, no kernel needed)
+node test/client-render-test.mjs   # client UI rendering (offline, 37 checks, no kernel needed)
 node test/dl-test.mjs              # kernel download only (fast)
 node test/busy-test.mjs            # busy-lock regression: kernel must survive a command longer than idleMs
 node test/selftest.mjs             # end-to-end: import config → download → start → go abroad → idle shutdown
@@ -791,7 +830,10 @@ node test/selftest.mjs             # end-to-end: import config → download → 
 `evaluateGate()`, was deliberately factored out as a **pure function** — it takes
 a "probe frame" object and returns a verdict, never touching the real system. So
 covering edges like a fullscreen explorer desktop, a fullscreen IME host, a failed
-probe or missing fields needs none of those situations to actually be staged.
+probe or missing fields needs none of those situations to actually be staged. The
+23 whitelist checks live here too: name matching / path matching / case / forward
+slashes / filling in a name alone lets through same-named programs in other
+directories / neither criterion participates on a hit / dirty input doesn't crash.
 
 `test/peers-test.mjs` works the same way: its decision core, `evaluatePeers()`, is
 a pure function fed constructed port-probe results. So the two key branches — "a

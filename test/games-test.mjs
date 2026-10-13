@@ -13,7 +13,7 @@
  *
  * 运行：node test/games-test.mjs
  */
-import { describeHit, evaluateGate, gameGate, QUNS_NAMES } from '../lib/games.js';
+import { describeHit, evaluateGate, gameGate, GAME_DEFAULTS, QUNS_NAMES } from '../lib/games.js';
 
 let pass = 0;
 let fail = 0;
@@ -215,6 +215,95 @@ for (const q of [5, 6, 7]) {
   // useProbe:false 让检测走「探测已跳过」路径 → 不拦（detect-failed 也算放过）
   const skip = await gameGate({ blockOnGame: true, useProbe: false });
   check('18b 探测跳过时不拦', skip.blocked === false, `reason=${skip.reason}`);
+}
+
+// ── 19. 用户白名单 ────────────────────────────────────────────
+{
+  // 白名单为空时不影响原判定
+  const noAllow = evaluateGate({ probe: frame({ quns: 2, fgPath: GAME }), allow: [] });
+  check('19 白名单为空时 QUNS=2 照样拦', noAllow.gameRunning === true);
+  check('19b 白名单为空时 allowed=false', noAllow.allowed === false);
+
+  // 按**裸名字**加白名单 → 命中
+  const byName = evaluateGate({ probe: frame({ quns: 2, fgPath: GAME }), allow: ['game.exe'] });
+  check('19c 按进程名命中白名单 → 不拦', byName.gameRunning === false, `allowed=${byName.allowed}`);
+  check('19d allowHit 标为 name', byName.allowHit === 'name', String(byName.allowHit));
+
+  // 名字匹配大小写不敏感
+  const upper = evaluateGate({ probe: frame({ quns: 2, fgPath: GAME }), allow: ['GAME.EXE'] });
+  check('19e 名字匹配大小写不敏感', upper.gameRunning === false);
+
+  // 按**完整路径**加白名单 → 命中
+  const byPath = evaluateGate({ probe: frame({ quns: 2, fgPath: GAME }), allow: [GAME] });
+  check('19f 按完整路径命中白名单 → 不拦', byPath.gameRunning === false);
+  check('19g allowHit 标为 path', byPath.allowHit === 'path', String(byPath.allowHit));
+
+  // 正斜杠写的路径也能匹配（用户从别处复制粘贴常见）
+  const slash = evaluateGate({
+    probe: frame({ quns: 2, fgPath: GAME }),
+    allow: ['D:/Games/SomeGame/bin/game.exe'],
+  });
+  check('19h 正斜杠路径也能匹配', slash.gameRunning === false);
+
+  // 路径大小写不敏感
+  const pathUpper = evaluateGate({
+    probe: frame({ quns: 2, fgPath: GAME }),
+    allow: [GAME.toUpperCase()],
+  });
+  check('19i 路径匹配大小写不敏感', pathUpper.gameRunning === false);
+
+  // 白名单里是别的程序 → 照拦
+  const other = evaluateGate({ probe: frame({ quns: 2, fgPath: GAME }), allow: ['obs64.exe'] });
+  check('19j 白名单里是别的程序 → 照样拦', other.gameRunning === true);
+
+  // 同名但不同目录：只填名字会连别的目录的一起放过（这是按名字匹配的固有代价）
+  const sameName = evaluateGate({
+    probe: frame({ quns: 2, fgPath: 'D:\\Other\\bin\\game.exe' }),
+    allow: ['game.exe'],
+  });
+  check('19k 只填名字会连别的目录的同名程序一起放过', sameName.gameRunning === false);
+
+  // 填全路径则只放过那一个
+  const sameNamePath = evaluateGate({
+    probe: frame({ quns: 2, fgPath: 'D:\\Other\\bin\\game.exe' }),
+    allow: [GAME],
+  });
+  check('19l 填全路径只放过那一个', sameNamePath.gameRunning === true);
+
+  // 判据 2（无边框全屏）同样受白名单影响
+  const fsAllow = evaluateGate({
+    probe: frame({ quns: 5, fgPath: GAME, caption: false, full: true }),
+    allow: ['game.exe'],
+  });
+  check('19m 白名单对无边框全屏判据同样生效', fsAllow.gameRunning === false);
+
+  // 判据 1 与判据 2 都被白名单压住时，hit 必须是 null
+  check('19n 命中白名单时 hit 为 null', fsAllow.hit === null);
+
+  // 白名单只影响前台程序，不影响其它字段
+  check('19o 命中白名单时 quns 仍如实上报', fsAllow.quns === 5);
+
+  // 各种脏输入都不能崩
+  check('19p allow 传非数组不崩',
+    evaluateGate({ probe: frame({ quns: 2, fgPath: GAME }), allow: 'game.exe' }).gameRunning === true);
+  check('19q allow 含 null/空串不崩',
+    evaluateGate({ probe: frame({ quns: 2, fgPath: GAME }), allow: [null, '', '   '] }).gameRunning === true);
+  check('19r 不传 allow 参数不崩',
+    evaluateGate({ probe: frame({ quns: 2, fgPath: GAME }) }).gameRunning === true);
+  check('19s 白名单条目前后空格被忽略',
+    evaluateGate({ probe: frame({ quns: 2, fgPath: GAME }), allow: ['  game.exe  '] }).gameRunning === false);
+
+  // 前台取不到程序名时白名单不该误命中
+  const noFg = evaluateGate({ probe: { ok: true, quns: 2, fgPath: '', caption: true, full: false }, allow: ['game.exe'] });
+  check('19t 前台程序取不到时白名单不误命中', noFg.allowed === false && noFg.gameRunning === true);
+}
+
+// ── 20. GAME_DEFAULTS 含白名单且默认为空 ──────────────────────
+{
+  check('20 GAME_DEFAULTS.gameAllow 默认为空数组',
+    Array.isArray(GAME_DEFAULTS.gameAllow) && GAME_DEFAULTS.gameAllow.length === 0);
+  check('20b blockOnGame 默认 true', GAME_DEFAULTS.blockOnGame === true);
+  check('20c stopOnGame 默认 false', GAME_DEFAULTS.stopOnGame === false);
 }
 
 console.log(`\n=== ${pass}/${pass + fail} PASS ===`);

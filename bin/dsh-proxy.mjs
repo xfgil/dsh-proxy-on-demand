@@ -32,7 +32,7 @@ import { ensureKernel, latestVersion, DEFAULT_MIRRORS } from '../lib/downloader.
 import { findFlClashConfig, materialize, exampleConfig } from '../lib/config.js';
 import { ProxyCore } from '../lib/core.js';
 import { configSummary, readSettings, writeSettings } from '../lib/settings.js';
-import { describeHit, detectGames, gameGate } from '../lib/games.js';
+import { describeHit, detectGames, gameGate, clearGameCache } from '../lib/games.js';
 import { describePeer, detectPeers, peerGate as peerGateFn } from '../lib/peers.js';
 import { disposeProbe } from '../lib/probe.js';
 
@@ -62,6 +62,9 @@ function parse(argv) {
     if (a === '--no-wait') { opts.noWait = true; continue; }
     if (a === '--no-gate') { opts.noGate = true; continue; }
     if (a === '--no-peer') { opts.noPeer = true; continue; }
+    if (a === '--allow') { opts.allow = argv[++i]; continue; }
+    if (a === '--allow-fg') { opts.allowFg = true; continue; }
+    if (a === '--unallow') { opts.unallow = argv[++i]; continue; }
     if (a === '--json') { opts.json = true; continue; }
     rest.push(a);
   }
@@ -84,13 +87,14 @@ const idleMs = opts.idle != null ? opts.idle * 1000 : (settings.idleMs ?? 120000
  */
 const gate = opts.noGate ? null : () => gameGate({
   blockOnGame: settings.blockOnGame !== false,
+  allow: settings.gameAllow ?? [],
   runtimeDir: RUNTIME,
 });
 
 /** 检测到游戏时是否关掉已在运行的内核（默认关，与「只拦新的」一致）。 */
 const gameWatch = opts.noGate ? null : () => {
   if (settings.stopOnGame !== true) return Promise.resolve({ gameRunning: false });
-  return detectGames({ runtimeDir: RUNTIME })
+  return detectGames({ runtimeDir: RUNTIME, allow: settings.gameAllow ?? [] })
     .then((d) => ({ gameRunning: d.gameRunning, what: describeHit(d) }));
 };
 
@@ -219,15 +223,68 @@ switch (cmd) {
     break;
   }
   case 'game': {
-    // dsh-proxy game [--json]
-    const d = await detectGames({ runtimeDir: RUNTIME, force: true });
+    // dsh-proxy game [--json] [--allow <名字或路径>] [--allow-fg] [--unallow <条目>]
+    // 注意 rest[0] 是 'game' 本身，子命令在 rest[1]
+    const sub = rest[1];
+    if (sub === 'allow' || opts.allow || opts.allowFg) {
+      const cur = settings.gameAllow ?? [];
+      let entry = opts.allow ? String(opts.allow).trim() : '';
+      if (!entry && opts.allowFg) {
+        const d = await detectGames({ runtimeDir: RUNTIME, force: true, allow: cur });
+        entry = d.fg?.name || d.fg?.path || '';
+        if (!entry) { console.error('当前没有可加入白名单的前台程序'); process.exit(1); }
+      }
+      if (!entry && sub === 'allow') entry = String(rest[2] ?? '').trim();
+      if (!entry) {
+        console.error('用法：dsh-proxy game allow <进程名或完整路径>');
+        console.error('  或：dsh-proxy game --allow-fg   （把当前前台程序加进来）');
+        process.exit(1);
+      }
+      const lower = entry.toLowerCase();
+      if (cur.some((x) => String(x).toLowerCase() === lower)) {
+        console.log(`「${entry}」已在白名单里：${JSON.stringify(cur)}`);
+        break;
+      }
+      const next = await writeSettings(RUNTIME, { gameAllow: [...cur, entry] });
+      clearGameCache();
+      console.log(`已把「${entry}」加进游戏检测白名单`);
+      console.log(`  当前白名单：${JSON.stringify(next.gameAllow)}`);
+      break;
+    }
+    if (sub === 'unallow' || opts.unallow) {
+      const entry = String(opts.unallow ?? rest[2] ?? '').trim();
+      if (!entry) { console.error('用法：dsh-proxy game unallow <条目>'); process.exit(1); }
+      const cur = settings.gameAllow ?? [];
+      const next = await writeSettings(RUNTIME, {
+        gameAllow: cur.filter((x) => String(x).toLowerCase() !== entry.toLowerCase()),
+      });
+      clearGameCache();
+      console.log(`已从白名单移除「${entry}」`);
+      console.log(`  当前白名单：${JSON.stringify(next.gameAllow)}`);
+      break;
+    }
+    if (sub === 'list') {
+      const cur = settings.gameAllow ?? [];
+      console.log(cur.length ? `白名单（${cur.length} 项）：` : '白名单为空（本插件不预置任何名单）');
+      for (const x of cur) console.log(`  ${x}`);
+      break;
+    }
+
+    const d = await detectGames({ runtimeDir: RUNTIME, force: true, allow: settings.gameAllow ?? [] });
     if (opts.json) { console.log(JSON.stringify(d, null, 2)); break; }
     console.log(`游戏检测：${d.gameRunning ? '⛔ 检测到游戏运行' : '✓ 没有检测到游戏'}`);
     console.log(`  系统状态：${d.qunsName ?? '-'}（QUNS ${d.quns ?? '-'}）`);
     console.log(`  探测：${d.probeOk ? `正常（${d.probeMs ?? '-'}ms）` : `不可用（${d.probeError ?? '未知'}）`}`);
     if (d.fg) console.log(`  前台程序：${d.fg.name || '未知'}${d.fg.path ? `  ${d.fg.path}` : ''}`);
+    if (d.allowed) {
+      console.log(`  白名单：当前前台程序命中（按${d.allowHit === 'path' ? '路径' : '名字'}），因此不拦`);
+    }
+    const curAllow = settings.gameAllow ?? [];
+    console.log(`  白名单：${curAllow.length ? `${curAllow.length} 项` : '空（本插件不预置任何名单）'}`);
     if (d.gameRunning) console.log(`  原因：${describeHit(d)}`);
     console.log(`  判定用时：${d.ms}ms`);
+    console.log('');
+    console.log('  误判时：dsh-proxy game allow <进程名>   或   dsh-proxy game --allow-fg');
     break;
   }
   case 'peers': {
@@ -368,6 +425,9 @@ dsh-proxy-on-demand —— 按需代理
   dsh-proxy stop                       立即关闭内核
   dsh-proxy import-flclash             从本机 FlClash 导入配置
   dsh-proxy game                       查看游戏检测结果（系统状态 + 前台程序）
+  dsh-proxy game list                  列出游戏检测白名单
+  dsh-proxy game allow <名字或路径>     把程序加进白名单（误判时用）
+  dsh-proxy game unallow <条目>         从白名单移除
   dsh-proxy peers                      查看是否有其它代理在运行（端口占用）
   dsh-proxy -- <命令> [参数...]         带着代理跑一条命令
 
@@ -377,6 +437,7 @@ dsh-proxy-on-demand —— 按需代理
   --no-wait     配合 start：立刻返回，不守着内核
   --no-gate     本次跳过游戏检测（游戏运行时也强行启用）
   --no-peer     本次跳过礼让检测（别的代理在跑也强行启用）
+  --allow-fg    把当前前台程序加进游戏白名单
   --json        以 JSON 输出
 
 环境变量：
