@@ -16,7 +16,7 @@
   "dshHost": {
     "testedVersion": "0.2.0-rc.2",
     "electron": "44.0.0",
-    "note": "面向该版本开发验证；依赖 webServer.register({kind:'prefix'}) 与 client slot settings.plugin.item。"
+    "note": "面向该版本开发验证；依赖 webServer.register({kind:'prefix'}) 与 client slot settings.section（注意 settings.plugin.item 在该版本并不存在）。"
   },
   "autoInstallNotice": "首次运行会自动下载 mihomo 内核（约 61MB）到 <插件>/runtime/，不需要手动安装；删除 runtime/ 即可完全清除。设 autoDownload:false 可关闭自动下载。",
   "disclaimer": "自用工具，按「原样」提供，不附带任何担保。代理内核、节点与订阅的来源及合法性由使用者自行负责；请遵守所在地法律法规与所使用服务的条款。作者不对使用后果承担责任。",

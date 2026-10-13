@@ -157,8 +157,9 @@ HMR picks up the change and reconciles — the plugin is live **without a restar
 
 ### Inside DSH
 
-Once installed, a card appears under **Settings → Plugins → On-demand proxy**
-(see below). The HTTP API is also available:
+Once installed, a page of its own — **Settings → On-demand proxy** — appears in
+the Settings sidebar (not a card under Settings → Plugins; see below). The HTTP
+API is also available:
 
 ```bash
 curl -X POST http://127.0.0.1:19387/dsh-proxy/fetch \
@@ -199,7 +200,7 @@ be routed through the proxy.
 
 ## Settings UI
 
-After installing, **Settings → Plugins** shows an "On-demand proxy" card with
+After installing, the Settings sidebar gains an "On-demand proxy" page with
 three sections:
 
 **Status** — running / port taken / stopped; kernel PID; seconds left until
@@ -414,17 +415,41 @@ module's top level, zeroing ordinary module-level variables; a Symbol key on
 is a `window.__ModuleLoader__.load({ id, factory })` form that `require("react")`s
 internally and exports `apply` / `inject` / `name`.
 
-**It registers into the `settings.plugin.item` slot**, which appears under
-Settings → Plugins:
+**It registers into the `settings.section` slot**, a page of its own in the
+Settings sidebar (not a card under Settings → Plugins):
 
 ```js
-ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
-  name: 'settings.plugin.item',
-  id: 'dsh-proxy-on-demand-settings',
-  key: 'dsh-proxy-on-demand',
+ctx.slots.inject('settings.section', () => ctx.slots.register({
+  name: 'settings.section',
+  id: 'dsh-proxy-on-demand',
   order: 60,
+  label: () => '按需代理',
+  icon: 'settings',
 }, Card));
 ```
+
+**Gotcha: `settings.plugin.item` does not exist on DSH 0.2.0-rc.2 here.** That
+name was copied out of `dsh-session-manager`'s source, but
+`cordis_inspect_query(client/Slots/listSubTree {root:'settings.plugin.item'})`
+returns `{"requestedRoot":{"name":"settings.plugin.item","available":false}}` —
+the name is simply absent from the live slot tree. Worse, **registering into a
+nonexistent slot throws nothing**: the whole panel silently fails to render while
+`plugin_manager` still reports the plugin's `fiberPhase` as `active`.
+
+Only `listSubTree {root:'settings.section'}` reveals the real topology and its
+`occupants`, letting you confirm your own id made it in:
+
+```json
+{ "registrant": "dsh-proxy-on-demand-client", "id": "dsh-proxy-on-demand",
+  "order": 60, "active": true }
+```
+
+Real settings/plugins-related slot names on this host: `settings.section` (a
+sidebar page), `settings.plugins.tab` (a page inside the Plugins section),
+`settings.general.item` (one preference row inside General), `plugins.bundle.config`
+(keyed by package name), `plugins.row.config` (keyed `<pkg>#<rowId>`),
+`plugins.detail.section`. When writing a client half, **call `listSubTree` first,
+then register.**
 
 **After `webServer.register({ kind: 'prefix' })`, the pathname still carries the
 prefix.** `url.pathname` is still `/dsh-proxy/status`, so strip it yourself:
@@ -442,10 +467,20 @@ TLS connection was established` — that's a usage error, not a broken proxy.
 
 ```bash
 node --check lib/index.js          # syntax check
+node test/client-render-test.mjs   # client UI rendering (offline, 18 checks, no kernel needed)
 node test/dl-test.mjs              # kernel download only (fast)
 node test/busy-test.mjs            # busy-lock regression: kernel must survive a command longer than idleMs
 node test/selftest.mjs             # end-to-end: import config → download → start → go abroad → idle shutdown
 ```
+
+`test/client-render-test.mjs` renders `lib/client.js`'s component through a minimal
+React stand-in in three states — data not yet loaded, data loaded, and errored —
+**with no network access and no kernel download**. It catches two classes of silent
+failure: registering into a nonexistent slot (the host reports nothing; the UI just
+never appears), and a render-time throw after `settings.json` is hand-edited into a
+bad shape (`subscriptionUrl: null` makes `subInput.trim()` throw
+`Cannot read properties of null`). Its fixtures mirror the real response shapes of
+the host's `/dsh-proxy/status` and `/settings`.
 
 `test/busy-test.mjs` covers a real bug that bit us: with `--idle 3` and a command
 that takes 10 seconds, the guard used to kill the kernel at second 3 and the

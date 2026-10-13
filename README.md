@@ -139,7 +139,7 @@ dsh plugin --profile <你的profile> add dsh-proxy-on-demand
 
 ### 在 DSH 里
 
-装上之后，**设置 → 插件 → 按需代理** 会出现一张卡片（见下节）。也可以用 HTTP 接口：
+装上之后，**设置 → 按需代理**（设置侧栏里独立的一页，不是「设置 → 插件」里的卡片）会出现完整界面（见下节）。也可以用 HTTP 接口：
 
 ```bash
 curl -X POST http://127.0.0.1:19387/dsh-proxy/fetch \
@@ -179,7 +179,7 @@ dsh-proxy --idle 600 -- npm install                          # 空闲 10 分钟�
 
 ## 设置界面
 
-装上插件后，**设置 → 插件** 里会出现「按需代理」卡片，分三块：
+装上插件后，**设置**侧栏里会多出一页「按需代理」，分三块：
 
 **状态** — 运行中 / 端口被占用 / 未运行；内核 PID；距离自动关还剩几秒；「立即启动」「立即关闭」「续期空闲计时」三个按钮。每 4 秒自动刷新。
 
@@ -344,16 +344,28 @@ const SEP = '\\\\\\\\?';   // 一个或两个字面反斜杠都认
 
 **客户端半边不用打包。** `package.json` 里声明 `dsh.client = { platform: "web", inject: [...] }`，入口 `lib/client.js` 是 `window.__ModuleLoader__.load({ id, factory })` 形式，内部 `require("react")`，导出 `apply` / `inject` / `name`。
 
-**注册到 `settings.plugin.item` slot。** 这个 slot 出现在「设置 → 插件」下：
+**注册到 `settings.section` slot。** 这个 slot 是「设置」侧栏里独立的一页（不是「设置 → 插件」里的一张卡片）：
 
 ```js
-ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
-  name: 'settings.plugin.item',
-  id: 'dsh-proxy-on-demand-settings',
-  key: 'dsh-proxy-on-demand',
+ctx.slots.inject('settings.section', () => ctx.slots.register({
+  name: 'settings.section',
+  id: 'dsh-proxy-on-demand',
   order: 60,
+  label: () => '按需代理',
+  icon: 'settings',
 }, Card));
 ```
+
+**踩坑：`settings.plugin.item` 在本机 DSH 0.2.0-rc.2 里并不存在。** 这个 slot 名是从 `dsh-session-manager` 源码里抄来的，但用 `cordis_inspect_query(client/Slots/listSubTree {root:'settings.plugin.item'})` 实测返回 `{"requestedRoot":{"name":"settings.plugin.item","available":false}}` —— 该名字根本不在 slot 树里。更麻烦的是**注册到不存在的 slot 不会报错**，整块界面只是静默不渲染，`plugin_manager` 里插件的 `fiberPhase` 照样是 `active`。
+
+用 `listSubTree {root:'settings.section'}` 才看到真实拓扑与 `occupants` 列表，确认自己的 id 有没有进去：
+
+```json
+{ "registrant": "dsh-proxy-on-demand-client", "id": "dsh-proxy-on-demand",
+  "order": 60, "active": true }
+```
+
+本机 slot 树里与设置/插件相关的真实名字：`settings.section`（设置侧栏一页）、`settings.plugins.tab`（Plugins 设置区里的一页）、`settings.general.item`（General 区里的一行偏好）、`plugins.bundle.config`（keyed，key = 包名）、`plugins.row.config`（keyed，`<包名>#<行 id>`）、`plugins.detail.section`。写客户端界面时**先 `listSubTree` 确认，再注册**。
 
 **HTTP 面注册后 pathname 仍带前缀。** `webServer.register({ kind: 'prefix', path: '/dsh-proxy', handler })` 之后，`url.pathname` 依然是 `/dsh-proxy/status`，需要自己剥：
 
@@ -367,10 +379,18 @@ const path = url.pathname.replace(/^\/dsh-proxy(?=-|\/|$)/, '') || '/';
 
 ```bash
 node --check lib/index.js          # 语法检查
+node test/client-render-test.mjs   # 客户端界面渲染（离线，18 项，不需要内核）
 node test/dl-test.mjs              # 只测内核下载（快）
 node test/busy-test.mjs            # 忙锁回归：命令比 idleMs 更久时内核必须活着
 node test/selftest.mjs             # 端到端：导入配置 → 下内核 → 启动 → 出国 → 空闲自关
 ```
+
+`test/client-render-test.mjs` 用一个最小 React 替身把 `lib/client.js` 的组件
+在「数据未到位 / 数据到位 / 出错」三种状态下各渲染一遍，**不联网、不下内核**。
+它抓的是两类静默失败：注册到不存在的 slot（宿主不报错，界面只是不出现）、
+以及 `settings.json` 被手工改坏后渲染期抛异常（`subscriptionUrl: null` 会让
+`subInput.trim()` 抛 `Cannot read properties of null`）。输入数据用的是宿主
+`/dsh-proxy/status` 与 `/settings` 的实测返回形状。
 
 `test/busy-test.mjs` 针对一个真实踩过的坑：`--idle 3` 配一条要跑 10 秒的命令，
 修复前守护会在第 3 秒杀掉内核、命令最后一步报 `ConnectionReset`。现在 6 项全过
