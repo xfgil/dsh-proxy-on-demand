@@ -250,6 +250,7 @@ The `runtime/` directory (excluded by `.gitignore`) holds runtime artifacts:
 | `settings.json` | the user settings above |
 | `core.pid` | PID of the current kernel (used only to kill our own) |
 | `lease.json` | the lease — "in use until" |
+| `busy.json` | the busy lock — "which long command is using it" (liveness by PID) |
 | `core.log` | kernel log |
 
 ## HTTP API
@@ -279,14 +280,16 @@ Everything listens on **loopback only** (`127.0.0.1` / `::1`); other origins get
 any use ──renew()──> write lease.json { deadline: now + idleMs }
                           │
 guard timer (every 15s) ──┘
+   a command holds the busy lock? ──yes──> never shut down (busy.json, liveness by PID)
+        │no
    deadline passed? ──no──> keep sleeping
         │yes
         └─> did **we** start the kernel? ──no──> drop the lease, leave the process alone
                  │yes
-                 └─> kill the PID in core.pid, delete pid/lease files
+                 └─> kill the PID in core.pid, delete pid/lease/busy files
 ```
 
-Three deliberate decisions:
+Four deliberate decisions:
 
 1. **Only kill the PID we started.** The state file records `core.pid`; it never
    kills by process name — that would risk killing the user's own FlClash or
@@ -294,10 +297,17 @@ Three deliberate decisions:
 2. **Never fight for the port.** If 7890 is already listening (say the user has
    FlClash open), the plugin does not start a kernel; it marks the state
    `external`, keeps working, and **will not** shut down a process it doesn't own.
-3. **The CLI waits it out.** The guard timer is `unref()`'d (it doesn't keep Node
-   alive), so `dsh-proxy start` stays in the foreground until the kernel is
-   actually auto-shut-down — otherwise the command would exit and nobody would be
-   left to run the "kill on expiry" step.
+3. **A long command holds the busy lock.** When `dsh-proxy -- <command>` runs, it
+   writes `busy.json` (holding its own PID) and keeps renewing the lease. While
+   that lock is held, `checkIdle()` never touches the kernel — otherwise a command
+   that outlives `idleMs` (`npm install`, `git clone`, …) would be cut off
+   mid-flight by the plugin's own guard, showing up as `ConnectionReset`. If the
+   holder process is gone, the lock expires by PID, so it can never wedge.
+4. **The CLI waits it out.** The guard timer is `unref()`'d (it doesn't keep Node
+   alive), so both `dsh-proxy start` and `dsh-proxy -- <command>` stay in the
+   foreground until the kernel is actually auto-shut-down — otherwise the command
+   would exit and nobody would be left to run the "kill on expiry" step, leaving
+   the kernel running, which is exactly what this plugin exists to prevent.
 
 ### Kernel acquisition: self-contained download + unzip
 
@@ -433,8 +443,14 @@ TLS connection was established` — that's a usage error, not a broken proxy.
 ```bash
 node --check lib/index.js          # syntax check
 node test/dl-test.mjs              # kernel download only (fast)
+node test/busy-test.mjs            # busy-lock regression: kernel must survive a command longer than idleMs
 node test/selftest.mjs             # end-to-end: import config → download → start → go abroad → idle shutdown
 ```
+
+`test/busy-test.mjs` covers a real bug that bit us: with `--idle 3` and a command
+that takes 10 seconds, the guard used to kill the kernel at second 3 and the
+command's last step failed with `ConnectionReset`. All 6 checks now pass (the
+command gets an exit IP, the kernel shuts down on policy, the busy lock is released).
 
 `test/selftest.mjs` runs the whole chain against **your real FlClash config**,
 with 14 checks:

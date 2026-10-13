@@ -224,6 +224,7 @@ dsh-proxy --idle 600 -- npm install                          # 空闲 10 分钟�
 | `settings.json` | 上面那份用户设置 |
 | `core.pid` | 当前内核 PID（只用来杀自己启动的那个） |
 | `lease.json` | 租约，记录「用到什么时候为止」 |
+| `busy.json` | 忙锁，记录「哪条长命令正在用」（按 PID 判存活） |
 | `core.log` | 内核日志 |
 
 ## HTTP 接口
@@ -253,18 +254,21 @@ dsh-proxy --idle 600 -- npm install                          # 空闲 10 分钟�
 任何一次使用 ──renew()──> 写 lease.json { deadline: now + idleMs }
                               │
 守护定时器（每 15s）───────────┘
+   有命令正持忙锁？──是──> 绝不关（busy.json，按 PID 判定存活）
+        │否
    deadline 到期？──否──> 继续睡
         │是
         └─> 内核是**我们**起的？──否──> 只删租约，不碰进程
                  │是
-                 └─> 杀 core.pid 里的那个 PID，删 pid/lease 文件
+                 └─> 杀 core.pid 里的那个 PID，删 pid/lease/busy 文件
 ```
 
-三个刻意的设计：
+四个刻意的设计：
 
 1. **只杀自己启动的 PID。** 状态文件里记着 `core.pid`，绝不按进程名扫杀 —— 否则会误杀用户自己开的 FlClash 或其他 mihomo。
 2. **端口被占时不抢。** 如果 7890 已经被别的程序监听（比如用户开了 FlClash），插件不启动内核，只标记 `external` 后照常可用，也**不会**在空闲时去关那个不属于自己的进程。
-3. **命令行守到最后。** 守护定时器是 `unref()` 的（不阻止 Node 退出）。所以 `dsh-proxy start` 会一直守着，直到内核真的被自动关掉才返回 —— 否则命令一跑完，就没人执行「到期杀内核」那一步了。
+3. **长命令期间持忙锁。** `dsh-proxy -- <命令>` 跑起来时会写 `busy.json`（内容是自己的 PID）并持续续租。只要锁在，`checkIdle()` 一律不动内核 —— 否则一条比 `idleMs` 更久的命令（比如 `npm install`、`git clone`）会在跑到一半时被自己的守护掐断，表现为 `ConnectionReset`。持有者进程若已消失，锁按 PID 自动失效，不会永久卡住。
+4. **命令行守到最后。** 守护定时器是 `unref()` 的（不阻止 Node 退出）。所以 `dsh-proxy start` 与 `dsh-proxy -- <命令>` 都会一直守着，直到内核真的被自动关掉才返回 —— 否则命令一跑完就退出，没人执行「到期杀内核」那一步，内核会一直挂着，正是本插件要消灭的情况。
 
 ### 内核获取：自包含下载 + 解压
 
@@ -364,8 +368,13 @@ const path = url.pathname.replace(/^\/dsh-proxy(?=-|\/|$)/, '') || '/';
 ```bash
 node --check lib/index.js          # 语法检查
 node test/dl-test.mjs              # 只测内核下载（快）
+node test/busy-test.mjs            # 忙锁回归：命令比 idleMs 更久时内核必须活着
 node test/selftest.mjs             # 端到端：导入配置 → 下内核 → 启动 → 出国 → 空闲自关
 ```
+
+`test/busy-test.mjs` 针对一个真实踩过的坑：`--idle 3` 配一条要跑 10 秒的命令，
+修复前守护会在第 3 秒杀掉内核、命令最后一步报 `ConnectionReset`。现在 6 项全过
+（命令拿到出口 IP、内核按策略自动关、忙锁已释放）。
 
 `test/selftest.mjs` 用**本机真实的 FlClash 配置**跑全链路，14 项检查：
 
