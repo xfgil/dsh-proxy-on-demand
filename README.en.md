@@ -225,12 +225,45 @@ be routed through the proxy.
 
 ## Settings UI
 
-After installing, the Settings sidebar gains an "On-demand proxy" page with
-three sections:
+After installing, the Settings sidebar gains an "On-demand proxy" page. From top
+to bottom:
 
-**Status** — running / port taken / stopped; kernel PID; seconds left until
-auto-shutdown; buttons for *start now*, *stop now* and *renew idle timer*.
-Refreshes every 4 seconds.
+**Status** — two switches, independent of each other:
+
+| Switch | On = | Off = |
+|---|---|---|
+| **Proxy kernel** | start mihomo (~0.5 s; the first run downloads the kernel) | stop the kernel, and restore the system proxy exactly |
+| **Windows system proxy** | send global traffic through the local kernel | browsers go direct (the kernel stays up) |
+
+Keeping these apart is deliberate: **the kernel only listens on `127.0.0.1`, so
+nobody is using it if you don't point anything at it; what actually changes your
+network environment is the system proxy.** So you can leave the kernel running
+with the system proxy off and just point `HTTP_PROXY` at it. The reverse is not
+allowed: turning the system proxy on first makes sure the kernel is up —
+pointing Windows at a port nobody is listening on would cut off your whole
+network, which is far worse than having no proxy.
+
+Next to the switches you get the kernel PID and port; in non-resident mode you
+also get "seconds left until auto-shutdown". Refreshes every 4 seconds.
+
+> If another program holds the system proxy (FlClash, say), the switch reads
+> "not taken over (held by another program)" and the plugin **reports it without
+> overriding** — it does not fight over your settings.
+
+**Node panel** — while the kernel runs, lists the nodes of the current group,
+name on the left and delay on the right, with `●` marking the one in use. A
+**Test delay** button at the top triggers a group-wide speed test; the list is a
+**fixed 8 rows per page** and scrolls beyond that.
+
+There is deliberately **no group dropdown**: groups all live in that one
+scrolling list. Speed testing is **delay only** — the connectivity test was
+dropped because in practice very few nodes passed it (only Hong Kong did, that
+one time), so it had little diagnostic value and was easily misread as "the
+network is broken".
+
+The test target is **whatever `url:` each group already configures** (usually
+the provider's `gstatic/generate_204`); the plugin does not rewrite it — see the
+corrected misdiagnosis under [Known limitations](#known-limitations).
 
 **Nodes** — three ways to supply a config:
 
@@ -242,14 +275,15 @@ Refreshes every 4 seconds.
 
 **Game detection** — shows the current system state
 (`SHQueryUserNotificationState`), the foreground program, and whether a game was
-detected; two switches (*block enabling the proxy while a game runs* / *shut the
-running proxy down when a game is detected*) plus a *re-check now* button. See
+detected; switches (*block enabling the proxy while a game runs* / *shut the
+kernel down too when a game is detected*) plus a *re-check now* button. See
 [Game detection](#game-detection) for details.
 
 **Parameters** — proxy port, idle timeout (seconds), enable/disable the plugin,
 and whether to auto-import FlClash on first run. Changes apply immediately.
 
-> A port change needs a kernel restart: *stop now*, then *start now*.
+> A port change needs a kernel restart: flip the **Proxy kernel** switch off and
+> back on.
 
 The UI **does not go through DSH's `settings` service**; it reads and writes the
 settings file and talks to the plugin's own HTTP endpoints. See
@@ -449,7 +483,10 @@ The plugin's own settings live in `<plugin>/runtime/settings.json`:
   "blockOnGame": true,
   "stopOnGame": false,
   "gameAllow": ["obs64.exe", "D:\\path\\to\\OBS\\obs64.exe"],
-  "yieldToPeer": true
+  "yieldToPeer": true,
+  "systemProxy": true,
+  "resident": false,
+  "proxyOnStart": true
 }
 ```
 
@@ -458,6 +495,13 @@ The plugin's own settings live in `<plugin>/runtime/settings.json`:
 alone), `gameAllow` defaults to `[]` (the whitelist is filled in by the user
 alone; the plugin preloads nothing), `yieldToPeer` defaults to `true` (step aside
 automatically when another proxy is detected).
+
+`systemProxy` defaults to `true` (let the plugin switch the Windows system proxy;
+turning it off restores your original settings exactly); `resident` defaults to
+**`false`** — i.e. the plugin's original behaviour, **shut down when done**. Turn
+it on for resident mode (never auto-shutdown when idle; exits with DSH).
+`proxyOnStart` defaults to `true` (turning the kernel on also turns the system
+proxy on).
 
 The `runtime/` directory (excluded by `.gitignore`) holds runtime artifacts:
 
@@ -471,6 +515,7 @@ The `runtime/` directory (excluded by `.gitignore`) holds runtime artifacts:
 | `lease.json` | the lease — "in use until" |
 | `busy.json` | the busy lock — "which long command is using it" (liveness by PID) |
 | `gameprobe.exe` / `gameprobe.cs` | the resident probe process for game detection (compiled on first use) |
+| `proxy-backup.json` | **your original system-proxy settings**, saved before the plugin takes over (written back field by field) |
 | `core.log` | kernel log |
 
 ## HTTP API
@@ -479,9 +524,14 @@ Everything listens on **loopback only** (`127.0.0.1` / `::1`); other origins get
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/dsh-proxy/status` | kernel running?, PID, seconds remaining |
+| GET | `/dsh-proxy/status` | kernel running?, PID, seconds remaining, current system-proxy state |
 | GET | `/dsh-proxy/settings` | read settings + current config summary |
 | POST | `/dsh-proxy/settings` | write settings |
+| GET | `/dsh-proxy/system-proxy` | current system-proxy state (ours? held by someone else?) |
+| POST | `/dsh-proxy/system-proxy` | `{"on":true\|false}` — switch the system proxy (makes sure the kernel is up first when turning it on) |
+| GET | `/dsh-proxy/proxies` | list groups and nodes (add `?fake=1` to include the informational pseudo-nodes) |
+| POST | `/dsh-proxy/proxies/select` | `{"group":"...","node":"..."}` — switch node, then **read back to confirm** |
+| POST | `/dsh-proxy/proxies/test` | `{"group":"...","timeoutMs":3000}` — test delay |
 | POST | `/dsh-proxy/prepare` | download kernel + prepare config |
 | POST | `/dsh-proxy/start` | start the kernel |
 | POST | `/dsh-proxy/stop` | stop the kernel |
@@ -723,9 +773,45 @@ redistribute this plugin, note that **downloading** a GPL-3.0 program and
   "TUN mode, which listens on no port"; in those cases this plugin starts as usual,
   but since that other proxy is still there, your commands actually keep going
   through it.
-- **Only tested on Windows 10/11 x64 + DSH 0.2.0-rc.2.**
-- **It does not take over the system proxy.** The plugin only exposes a local HTTP
-  proxy port; setting `HTTP_PROXY` is the caller's business.
+- **Tested only on Windows 10/11 x64 + DSH 0.2.0-rc.2.**
+- **Takes over the system proxy (can be turned off).** When the kernel comes up it
+  points the Windows system proxy at the local port by default, which is what most
+  people mean by "the proxy is on". Your original settings are backed up to
+  `runtime/proxy-backup.json` and written back field by field when it's turned off
+  (**including `ProxyEnable=0`** — if you hadn't turned it on, it won't leave it on
+  for you). If you run FlClash yourself, the plugin **reports without overriding**.
+  Turn off "let this plugin manage the Windows system proxy" in settings to disable
+  the behaviour entirely.
+
+### A misdiagnosis, corrected: the speed-test target
+
+On 2026-10-13 I made the config-import path do this: replace the per-group test
+address `url: https://www.gstatic.com/generate_204` with the domestic
+`connect.rom.miui.com`, reasoning "gstatic is blocked in China → the panel is all
+timeouts".
+
+**That causal chain is wrong, and the change has been reverted.** A kernel speed
+test is a request **sent through the node**, leaving from wherever the node is —
+it has nothing to do with whether *this machine* can reach gstatic directly. The
+controlled comparison (3 automatic groups × 4 members = 12 samples; after testing,
+read back the top-level `history` the panel reads and count members with a valid
+delay):
+
+| Test target | Valid |
+|---|---|
+| Not passed (kernel uses the group's own target) | **11/12 = 92%** |
+| The group's own `testUrl` passed explicitly | 10/12 = 83% |
+| Rewritten to miui | 10/12 = 83% |
+
+All three are equivalent, so there is **no reason to rewrite the user's test
+target**. The real cause of "everything times out" was a **DNS port conflict**
+(FlClash holding `1053`, so the kernel's DNS never came up → nothing resolved →
+every target timed out at once), fixed by `forceDnsPort()` switching ports — and
+unrelated to the test target.
+
+Likewise, a node's `history` is **not** bucketed by test URL — passing miui or
+gstatic both update the same top-level `history` the panel reads, so there is no
+"testing against another target makes the panel blind" problem either.
 
 ## Implementation notes
 

@@ -16,19 +16,41 @@
  */
 import { promises as fsp } from 'node:fs';
 import { existsSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 
-import { materialize, findFlClashConfig } from '../lib/config.js';
+import { materialize, findFlClashConfig, forceExternalController, forceDnsPort, readExternalController } from '../lib/config.js';
 import { ensureKernel, latestVersion } from '../lib/downloader.js';
 import { ProxyCore } from '../lib/core.js';
 import { countProxies, countRules, configSummary } from '../lib/settings.js';
+import { listProxies, testConnectivity, sampleActivity } from '../lib/nodes.js';
 
 const RUNTIME = 'C:\\Users\\暝\\AppData\\Local\\Temp\\dsh-proxy-selftest';
+/** 管理 API 端口与密钥（自测专用；真实运行由 index.js 动态分配）。 */
+const CTL_PORT = 9099;
+const CTL_SECRET = 'selftest-secret';
 const results = [];
 const check = (name, cond, detail = '') => results.push({ name, pass: !!cond, detail });
 
+// 清掉上一轮的产物，但**保留已下载的内核**。
+//
+// 原来是 `rmSync(RUNTIME, {recursive:true})` —— 整目录删掉，于是每次自测都要
+// 重新下载 61MB。后果是「验证插件逻辑」这件事被绑死在 GitHub 连通性上：
+// 直连超时 / 镜像抽风时，步骤 3 抛一句 `aborted`，自测就停在 24/25，
+// 而代码本身毫无问题（同一次改动，重跑可能 38/38 也可能 24/25）。
+// 内核是下载产物、与逻辑无关，没理由每轮重下。
+//
+// 做法：先把内核挪到临时处，清完目录再挪回来 —— 让 `ensureKernel` 走缓存分支。
+const KERNEL_EXE = join(RUNTIME, 'mihomo.exe');
+const STASH = join(dirname(RUNTIME), 'dsh-proxy-selftest-kernel.bin');
+const hadKernel = existsSync(KERNEL_EXE);
+if (hadKernel) {
+  await fsp.copyFile(KERNEL_EXE, STASH);
+} else if (existsSync(STASH)) {
+  console.log(`   [prep] 复用上次留存的内核（${Math.round((await fsp.stat(STASH)).size / 1e6)}MB），本轮不联网下载`);
+}
 rmSync(RUNTIME, { recursive: true, force: true });
 await fsp.mkdir(join(RUNTIME, 'providers', 'rules'), { recursive: true });
+if (existsSync(STASH)) await fsp.copyFile(STASH, KERNEL_EXE);
 
 try {
   // 1. 找 FlClash 配置
@@ -37,7 +59,13 @@ try {
   if (!found.found) throw new Error('SKIP');
 
   // 2. materialize：绝对路径 → 相对路径
-  const r = await materialize(found.path, RUNTIME);
+  //
+  // ⚠️ 必须传 controllerPort —— 否则 materialize 不会打开管理 API，
+  // 后面「节点列表 / 选节点」就全废了（这正是 2026-10-13 那个事故的根因之一：
+  // 导入的 FlClash 配置里 external-controller 是空串）。
+  const r = await materialize(found.path, RUNTIME, {
+    controllerPort: CTL_PORT, controllerSecret: CTL_SECRET,
+  });
   check('2 识别出 rule-provider 绝对路径', r.rulesTotal > 0, `共 ${r.rulesTotal} 条，新拷 ${r.copied}`);
   const cfgText = await fsp.readFile(join(RUNTIME, 'config.yaml'), 'utf8');
   // 有换行转义，检查替换是否生效（相对路径出现 & 绝对路径残留）
@@ -88,6 +116,44 @@ try {
   check('2c 相对路径已写入', relative === r.rulesTotal, `${relative}/${r.rulesTotal}`);
   check('2d 规则文件已拷贝到位', existsSync(join(RUNTIME, 'providers', 'rules')), '');
 
+  // ── 2k~2o：管理 API 与 DNS 端口（2026-10-13 事故的两个根因）──────────────
+  //
+  // 2k/2l 对应「没有节点列表、选不了节点」：导入的 FlClash 配置把
+  // external-controller 写成空串，管理 API 根本没开。
+  // 2n/2o 对应「测速全部超时」：DNS 端口 1053 被 FlClashCore 占着，
+  // 内核 DNS 起不来 → 域名解析不了 → 任何节点都连不出去。
+  {
+    const t = await fsp.readFile(join(RUNTIME, 'config.yaml'), 'utf8');
+    const ec = readExternalController(t);
+    check('2k 配置里已打开管理 API', Number.isInteger(ec.port) && ec.port > 0, `port=${ec.port}`);
+    check('2l 管理 API 只绑本机', ec.host === '127.0.0.1', ec.host);
+    check('2m 已写入 secret', typeof ec.secret === 'string' && ec.secret.length > 0, `${ec.secret.length} 字符`);
+
+    // forceExternalController 的纯函数行为（三种输入都要覆盖成唯一一条）
+    const cases = [
+      ['空串', 'external-controller: ""\nsecret: ""\n'],
+      ['根本没有这一行', 'mixed-port: 7890\n'],
+      ['写成别的端口', 'external-controller: 0.0.0.0:9999\n'],
+    ];
+    for (const [label, src] of cases) {
+      const out = forceExternalController(src, 9099, 'SEC');
+      const got = readExternalController(out.text);
+      check(`2n external-controller 覆盖正确（${label}）`,
+        got.port === 9099 && got.host === '127.0.0.1' && got.secret === 'SEC',
+        `port=${got.port} host=${got.host}`);
+      // 只应有一条，不能重复（重复会让内核解析失败）
+      const n = (out.text.match(/^external-controller:/gm) || []).length;
+      check(`2n2 只有一条 external-controller（${label}）`, n === 1, `找到 ${n} 条`);
+    }
+
+    // DNS 端口：不能插到文件开头（会把 YAML 打断），且必须落到 dns 段内
+    const dnsSrc = '# 注释\nmixed-port: 7890\ndns:\n  enable: true\n  listen: 127.0.0.1:1053\n';
+    const dnsOut = await forceDnsPort(dnsSrc, 1053);
+    check('2o DNS listen 被改写', /^\s+listen: 127\.0\.0\.1:\d+$/m.test(dnsOut.text), dnsOut.text.split('\n').find((l) => /listen:/.test(l)) ?? '');
+    check('2o2 DNS 没被插到文件开头', !/^dns:|^  listen:/.test(dnsOut.text.split('\n')[0]), dnsOut.text.split('\n')[0]);
+    check('2o3 store-selected 被打开', /store-selected:\s*true/.test(t), '');
+  }
+
   // 3. 下载内核
   const tmpEnv = process.env;
   const tag = await latestVersion('https://api.github.com/repos/MetaCubeX/mihomo/releases/latest');
@@ -98,6 +164,9 @@ try {
     url: `https://github.com/MetaCubeX/mihomo/releases/download/${ver}/mihomo-windows-amd64-${ver}.zip`,
     entry: 'mihomo-windows-amd64.exe',
     exe: 'mihomo.exe',
+    // 打印走的哪个源 —— 下载失败时这是唯一能看出"卡在哪一步"的线索
+    // （之前它只报一句 "aborted"，完全无法定位）。
+    onLog: (m) => console.log(`   [dl] ${m}`),
   });
   check('3b 内核下载并解压成功', k.ok && k.bytes > 20e6, `${Math.round(k.bytes / 1e6)}MB`);
 
@@ -166,7 +235,57 @@ try {
   }).catch((e) => ({ code: 0, err: String(e.message) }));
   check('5b 走内核代理能出国（CONNECT 隧道）', ok.code === 200, `HTTP ${ok.code} ip=${ok.ip ?? ok.err}`);
 
+  // ── 5c~5e：节点面板的后端（2026-10-13 新增）────────────────────────────
+  //
+  // 这一段是「节点列表 / 选节点 / 连通性测试」的真实验证：
+  // 内核已在跑，所以能直接问管理 API，不必 mock。
+  {
+    const ep = readExternalController(await fsp.readFile(join(RUNTIME, 'config.yaml'), 'utf8'));
+    const list = await listProxies(ep);
+    check('5c 内核在跑时能读到节点', list.coreRunning === true && (list.nodes?.length ?? 0) > 0,
+      `${list.nodes?.length ?? 0} 个节点 / ${list.groups?.length ?? 0} 个分组`);
+    check('5d 节点里不含 DIRECT/REJECT 等内建项',
+      !list.nodes?.some((n) => /^(DIRECT|REJECT)$/.test(n.name)), '');
+    check('5e 信息伪节点已过滤',
+      !list.nodes?.some((n) => /^(剩余流量|套餐到期|距离下次)/.test(n.name)), '');
+
+    // 连通性测试：真的以某个节点为出口发一次请求。
+    // 不强求「必须有可用节点」—— 节点可用性取决于订阅本身，
+    // 这里只验证**API 能调通、返回结构正确**（这才是我们能控制的部分）。
+    const probe = list.nodes?.[0]?.name;
+    if (probe) {
+      const c = await testConnectivity(ep, probe, { timeoutMs: 8000 });
+      check('5f 连通性测试能调通并返回结构',
+        typeof c.ok === 'boolean' && typeof c.verdict === 'string',
+        `${probe} → ${c.ok ? c.delay + 'ms' : c.verdict}`);
+    }
+  }
+
+  // 5g/5h：自动续租（修「用 github 时关闭倒计时仍在继续」）
+  //
+  // 事故：租约只由 renew() 写入，而 renew 只在 CLI 命令里调用；浏览器走代理的
+  // 流量插件感知不到 → 用户正用着，倒计时照样走完把内核杀了。
+  // 修法：守护 tick 先问一次「代理还有没有流量」，有就自动续租。
+  {
+    let lastAct = null;
+    const probeFn = async () => {
+      const a = await sampleActivity(readExternalController(
+        await fsp.readFile(join(RUNTIME, 'config.yaml'), 'utf8'),
+      ), lastAct);
+      lastAct = { up: a.up, down: a.down };
+      return a;
+    };
+    // 首次采样只是建立基线，不算活跃
+    const a0 = await probeFn();
+    check('5g 活跃探测首次采样不算活跃', a0.active === false, a0.detail);
+    // 结构必须对：有 up/down 才能做前后比较
+    check('5h 活跃探测返回累计字节', Number.isFinite(a0.up) && Number.isFinite(a0.down), `up=${a0.up} down=${a0.down}`);
+  }
+
   // 6. 空闲自动关
+  // 注意：这里要把 activityWatch 摘掉 —— 否则一旦有流量就会自动续租，
+  // 永远等不到「空闲关闭」，这条用例会误判为失败。
+  core.activityWatch = null;
   const beforePid = (await core.status()).pid;
   const aliveBefore = await core.pidAlive(beforePid);
   check('6 内核 PID 已记录', aliveBefore === true, `pid=${beforePid}`);
