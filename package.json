@@ -1,0 +1,77 @@
+{
+  "name": "dsh-proxy-on-demand",
+  "version": "0.1.0",
+  "description": "DSH 按需代理插件：需要时自动拉起 mihomo 内核，空闲后自动关闭，平时不占端口、不留后台进程。自带设置界面，可填订阅、从 FlClash 导入或手动粘贴节点。首次运行会自动联网下载内核（约 61MB）到插件目录，删掉即清除。On-demand proxy for DeepSeek Harness: spawns a mihomo core only when needed and shuts it down automatically when idle.",
+  "private": false,
+  "type": "module",
+  "main": "lib/index.js",
+  "upstream": {
+    "name": "mihomo",
+    "description": "Clash.Meta 内核；本插件不含其二进制，仅按需从官方 Release 下载并以独立进程调用。",
+    "homepage": "https://github.com/MetaCubeX/mihomo",
+    "license": "GPL-3.0",
+    "copyright": "MetaCubeX and mihomo contributors",
+    "testedVersion": "v1.19.32"
+  },
+  "dshHost": {
+    "testedVersion": "0.2.0-rc.2",
+    "electron": "44.0.0",
+    "note": "面向该版本开发验证；依赖 webServer.register({kind:'prefix'}) 与 client slot settings.plugin.item。"
+  },
+  "autoInstallNotice": "首次运行会自动下载 mihomo 内核（约 61MB）到 <插件>/runtime/，不需要手动安装；删除 runtime/ 即可完全清除。设 autoDownload:false 可关闭自动下载。",
+  "disclaimer": "自用工具，按「原样」提供，不附带任何担保。代理内核、节点与订阅的来源及合法性由使用者自行负责；请遵守所在地法律法规与所使用服务的条款。作者不对使用后果承担责任。",
+  "bin": {
+    "dsh-proxy": "bin/dsh-proxy.mjs"
+  },
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "proxy",
+    "mihomo",
+    "clash",
+    "on-demand",
+    "auto-shutdown",
+    "idle-timeout"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xfgil/dsh-proxy-on-demand.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xfgil/dsh-proxy-on-demand/issues"
+  },
+  "homepage": "https://github.com/xfgil/dsh-proxy-on-demand#readme",
+  "author": "xfgil",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  }
+}
