@@ -24,6 +24,7 @@ import { ensureKernel, latestVersion } from '../lib/downloader.js';
 import { ProxyCore } from '../lib/core.js';
 import { countProxies, countRules, configSummary, writeManualConfig } from '../lib/settings.js';
 import { listProxies, testConnectivity, testGroupDelay, sampleActivity, FAILED_AT_MS } from '../lib/nodes.js';
+import { proxyGet } from '../lib/index.js';
 import { buildRestoreScript } from '../lib/systemproxy.js';
 
 const RUNTIME = 'C:\\Users\\暝\\AppData\\Local\\Temp\\dsh-proxy-selftest';
@@ -329,6 +330,25 @@ try {
     s.setTimeout(25000, () => resolve({ code: 0, err: 'tunnel timeout' }));
   }).catch((e) => ({ code: 0, err: String(e.message) }));
   check('5b 走内核代理能出国（CONNECT 隧道）', ok.code === 200, `HTTP ${ok.code} ip=${ok.ip ?? ok.err}`);
+
+  // ── 5b2：/fetch 必须带 User-Agent（2026-10-14 修的真缺陷）──────────────
+  //
+  // 原先 `proxyGet()` **一个请求头都不带**，后果是 GitHub 的 REST API 一律回
+  // 403「Request forbidden by administrative rules. Please make sure your
+  // request has a User-Agent header」—— 不是限流，是 GitHub 对所有 REST
+  // 请求强制要求 UA。而 `/fetch` 最常见的用途恰恰就是抓 api.github.com
+  // （README 的示例就是它），所以这条踩得一点不冤。
+  //
+  // 这里直接调 `proxyGet()`（为此它被导出），而不是另写一份「带 UA 的请求」——
+  // 后者测的是 GitHub 的行为，只有前者才锁得住我们的实现。
+  {
+    const r = await proxyGet('https://api.github.com/zen', port, 4096);
+    check(
+      '5b2 /fetch 带 User-Agent（GitHub API 不再 403）',
+      r.status === 200,
+      `HTTP ${r.status} ${String(r.body ?? '').trim().slice(0, 40)}`,
+    );
+  }
 
   // ── 5c~5e：节点面板的后端（2026-10-13 新增）────────────────────────────
   //

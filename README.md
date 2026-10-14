@@ -472,6 +472,15 @@ dsh-proxy --no-peer -- cmd   # 本次跳过礼让，强行启用
 }
 ```
 
+> **`/fetch` 会带上 `User-Agent`。** 2026-10-14 修的一个真缺陷：它的两个分支原先
+> **一个请求头都不带**，于是 GitHub 的 REST API 一律回 **403**
+> （`Request forbidden by administrative rules. Please make sure your request has
+> a User-Agent header.`）—— **不是限流**：同一个 URL、同一个代理端口，换
+> `Invoke-WebRequest` 走一遍就是 200（`x-ratelimit-remaining: 58`）。GitHub 对
+> **所有** REST 请求强制要求 UA，而 `/fetch` 最常见的用途恰恰就是抓
+> `api.github.com`（上面命令行示例就是它）。现在两个分支都带
+> `dsh-proxy-on-demand (+https://github.com/xfgil/dsh-proxy-on-demand)`。
+
 ## 它是怎么做到的
 
 ### 空闲自动关：租约 + 守护

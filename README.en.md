@@ -614,6 +614,16 @@ Blocked by the peer gate it's a 409 as well, with `reason` set to `peer-running`
 }
 ```
 
+> **`/fetch` always sends a `User-Agent`.** A real defect fixed on 2026-10-14: neither
+> branch sent **any** request header, so GitHub's REST API answered **403** every time
+> (`Request forbidden by administrative rules. Please make sure your request has a
+> User-Agent header.`) — and that is **not** rate limiting: the same URL through the
+> same proxy port returns 200 via `Invoke-WebRequest` (`x-ratelimit-remaining: 58`).
+> GitHub requires a UA on **every** REST request, and `api.github.com` happens to be
+> the most common thing `/fetch` is used for (it's the example in the CLI section
+> above). Both branches now send
+> `dsh-proxy-on-demand (+https://github.com/xfgil/dsh-proxy-on-demand)`.
+
 ## How it works
 
 ### Auto-shutdown: lease + guard
