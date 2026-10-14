@@ -60,9 +60,9 @@ try { pid = JSON.parse(await readFile(join(ROOT, 'runtime', 'core.pid'), 'utf8')
 ok(pid === null, '4 内核已按空闲策略自动关闭（core.pid 已清理）');
 ok(/内核已按空闲策略自动关闭/.test(r.err), '5 日志确认自动关闭');
 
-// 忙锁文件也不应残留
+// 忙锁文件也不应残留（`.state` 不是 `.json` —— 见 lib/core.js 的说明）
 let busy = null;
-try { busy = await readFile(join(ROOT, 'runtime', 'busy.json'), 'utf8'); } catch { /* 已清理 */ }
+try { busy = await readFile(join(ROOT, 'runtime', 'busy.state'), 'utf8'); } catch { /* 已清理 */ }
 ok(busy === null, '6 忙锁已释放');
 
 console.log(`\nBUSYTEST: ${fail === 0 ? 'PASS' : 'FAIL'} (${pass}/${pass + fail})`);

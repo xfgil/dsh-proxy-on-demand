@@ -23,7 +23,7 @@ import { materialize, findFlClashConfig, forceExternalController, forceDnsPort, 
 import { ensureKernel, latestVersion } from '../lib/downloader.js';
 import { ProxyCore } from '../lib/core.js';
 import { countProxies, countRules, configSummary, writeManualConfig } from '../lib/settings.js';
-import { listProxies, testConnectivity, sampleActivity, FAILED_AT_MS } from '../lib/nodes.js';
+import { listProxies, testConnectivity, testGroupDelay, sampleActivity, FAILED_AT_MS } from '../lib/nodes.js';
 import { buildRestoreScript } from '../lib/systemproxy.js';
 
 const RUNTIME = 'C:\\Users\\暝\\AppData\\Local\\Temp\\dsh-proxy-selftest';
@@ -378,6 +378,35 @@ try {
         typeof c.ok === 'boolean' && typeof c.verdict === 'string',
         `${probe} → ${c.ok ? c.delay + 'ms' : c.verdict}`);
     }
+
+    // 5m/5n：整组测延迟（2026-10-14 用户报「全部超时」的回归锁）。
+    //
+    // 根因：**Selector 分组不传 url 时，内核拿着空 url 去测**，每个成员都在
+    // `urlToMetadata('')` 上判 "scheme not Support" → 整组 4ms 内全失败 →
+    // 接口回 `504 all proxies timeout`。而面板点「测延迟」时操作的正是
+    // **第一个可手选分组**（Selector），并且不传 url —— 于是那颗按钮 100% 失败，
+    // 界面满屏「超时」。
+    //
+    // 这里**故意不传 url**，锁的就是这条路径：自动组无所谓（它们自己重写了
+    // URLTest），但 Selector 必须靠我们补上目标。
+    const sel = (list.groups ?? []).find((x) => x.selectable === true);
+    if (sel) {
+      const t0 = Date.now();
+      const gr = await testGroupDelay(ep, sel.name, { timeoutMs: 4000 });
+      const cost = Date.now() - t0;
+      check('5m 整组测延迟（不传 url）不再全部失败', gr.ok === true,
+        gr.ok ? `${sel.name} ← ${gr.url}（${cost}ms）` : `❌ ${gr.error}`);
+
+      const after = await listProxies(ep);
+      const grp = (after.groups ?? []).find((x) => x.name === sel.name);
+      const names = new Set(grp?.members ?? []);
+      const members = (after.nodes ?? []).filter((n) => names.has(n.name));
+      const got = members.filter((n) => n.delay != null);
+      // 阈值取一半：节点本身的可用性取决于订阅，但「全部超时」这个 bug
+      // 下拿到延迟的成员恒为 0，与半数阈值差得很远，足以区分。
+      check('5n 测延迟后成员拿到了延迟值', got.length >= Math.ceil(members.length / 2),
+        `${got.length}/${members.length} 个成员有延迟`);
+    }
   }
 
   // 5g/5h：自动续租（修「用 github 时关闭倒计时仍在继续」）
@@ -414,7 +443,9 @@ try {
   await new Promise((r) => setTimeout(r, 1500));
   const aliveAfter = await core.pidAlive(beforePid);
   check('6b 空闲后已自动关闭', aliveAfter === false, `pid=${beforePid} alive=${aliveAfter}`);
-  const leaseGone = !existsSync(join(RUNTIME, 'lease.json'));
+  // 状态文件是 `.state` 不是 `.json` —— 见 lib/core.js 的说明：只有 `.json`
+  // 会触发宿主热重载，所以哪怕只是「写个租约」也不能用 `.json`。
+  const leaseGone = !existsSync(join(RUNTIME, 'lease.state'));
   check('6c 租约文件已清理', leaseGone, '');
 
   core.dispose();

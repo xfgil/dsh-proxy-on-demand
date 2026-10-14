@@ -14,7 +14,7 @@
 | **`dsh-proxy-on-demand`** — 按需代理，用完自动关（本仓库） |
 | [`dsh-hot-reloader`](https://github.com/xfgil/dsh-hot-reloader) — 改完插件源码不用重启 |
 | [`dsh-session-clock`](https://github.com/xfgil/dsh-session-clock) — 按会话授时与空闲间隔 |
-| [`dsh-onebot-guard`](https://github.com/xfgil/dsh-onebot-guard) — QQ 通道出站闸 |
+| [`dsh-onebot-companion`](https://github.com/xfgil/dsh-onebot-companion) — QQ 通道一体化：出站沉默守卫 / 行为规则 / 对话节奏 / 人设 / 语音 |
 
 > [!IMPORTANT]
 > **首次运行会自动联网下载内核。** 本插件不含内核二进制，第一次要用时会从
@@ -355,7 +355,7 @@ dsh-proxy --no-peer -- cmd   # 本次跳过礼让，强行启用
 
 ## 配置
 
-插件自己的设置存在 `<插件>/runtime/settings.json`：
+插件自己的设置存在 `<插件>/runtime/settings.state`：
 
 ```json
 {
@@ -388,13 +388,27 @@ dsh-proxy --no-peer -- cmd   # 本次跳过礼让，强行启用
 | `mihomo.exe` | 内核（首次用时自动下载） |
 | `config.yaml` | 喂给内核的配置 |
 | `providers/rules/` | rule-provider 规则文件 |
-| `settings.json` | 上面那份用户设置 |
+| `settings.state` | 上面那份用户设置 |
 | `core.pid` | 当前内核 PID（只用来杀自己启动的那个） |
-| `lease.json` | 租约，记录「用到什么时候为止」 |
-| `busy.json` | 忙锁，记录「哪条长命令正在用」（按 PID 判存活） |
+| `lease.state` | 租约，记录「用到什么时候为止」 |
+| `busy.state` | 忙锁，记录「哪条长命令正在用」（按 PID 判存活） |
 | `gameprobe.exe` / `gameprobe.cs` | 游戏检测用的常驻探测进程（首次用时自动编译） |
-| `proxy-backup.json` | **接管系统代理前的原设置备份**（还原时逐字段写回） |
+| `proxy-backup.state` | **接管系统代理前的原设置备份**（还原时逐字段写回） |
 | `core.log` | 内核日志 |
+
+> **为什么状态文件是 `.state` 而不是 `.json`？**
+>
+> 宿主会盯着插件目录，而它的插件监视器**只看 `.json`**（2026-10-14 用 21 种扩展名实测的矩阵：`.state`/`.log`/`.txt`/`.dat`/`.lock`/`.yaml`/`.pid`… 全都不触发，**只有 `.json` 触发**，子目录里的 `.json` 同样触发）。一触发就是一次完整的热重载：**先 dispose 旧实例，再 apply 新实例**。
+>
+> 所以只要状态文件叫 `.json`，每写一次盘就重建一次插件，其中最要命的一条链是：
+>
+> 1. 你点「开系统代理」→ 插件写 `proxy-backup.json`（备份你的原设置）；
+> 2. **这一次写盘就触发了热重载**；
+> 3. 新实例接手时去读注册表，而旧实例那条改注册表的 PowerShell 还没跑完（实测 ~700ms）→ 新实例判「系统代理不是我们的」→ 把刚写的备份删掉；
+> 4. 注册表随后才变成「已启用」——**代理开着、备份没了**；
+> 5. 于是你再也关不掉它：关的分支读不到备份，只能回一句「我们没改过」。
+>
+> 换成 `.state` 之后热重载**根本不会发生**，这条竞态从根上消失，而不是靠补丁躲过去。旧版本留下的 `.json` 会在启动时自动迁移（`migrateStateFiles()`），迁移完就删掉——留着它仍会继续触发热重载。
 
 ## HTTP 接口
 
@@ -453,10 +467,10 @@ dsh-proxy --no-peer -- cmd   # 本次跳过礼让，强行启用
 ### 空闲自动关：租约 + 守护
 
 ```
-任何一次使用 ──renew()──> 写 lease.json { deadline: now + idleMs }
+任何一次使用 ──renew()──> 写 lease.state { deadline: now + idleMs }
                               │
 守护定时器（每 15s）───────────┘
-   有命令正持忙锁？──是──> 绝不关（busy.json，按 PID 判定存活）
+   有命令正持忙锁？──是──> 绝不关（busy.state，按 PID 判定存活）
         │否
    deadline 到期？──否──> 继续睡
         │是
@@ -469,7 +483,7 @@ dsh-proxy --no-peer -- cmd   # 本次跳过礼让，强行启用
 
 1. **只杀自己启动的 PID。** 状态文件里记着 `core.pid`，绝不按进程名扫杀 —— 否则会误杀用户自己开的 FlClash 或其他 mihomo。
 2. **端口被占时不抢。** 如果 7890 已经被别的程序监听（比如用户开了 FlClash），插件不启动内核，只标记 `external` 后照常可用，也**不会**在空闲时去关那个不属于自己的进程。
-3. **长命令期间持忙锁。** `dsh-proxy -- <命令>` 跑起来时会写 `busy.json`（内容是自己的 PID）并持续续租。只要锁在，`checkIdle()` 一律不动内核 —— 否则一条比 `idleMs` 更久的命令（比如 `npm install`、`git clone`）会在跑到一半时被自己的守护掐断，表现为 `ConnectionReset`。持有者进程若已消失，锁按 PID 自动失效，不会永久卡住。
+3. **长命令期间持忙锁。** `dsh-proxy -- <命令>` 跑起来时会写 `busy.state`（内容是自己的 PID）并持续续租。只要锁在，`checkIdle()` 一律不动内核 —— 否则一条比 `idleMs` 更久的命令（比如 `npm install`、`git clone`）会在跑到一半时被自己的守护掐断，表现为 `ConnectionReset`。持有者进程若已消失，锁按 PID 自动失效，不会永久卡住。
 4. **命令行守到最后。** 守护定时器是 `unref()` 的（不阻止 Node 退出）。所以 `dsh-proxy start` 与 `dsh-proxy -- <命令>` 都会一直守着，直到内核真的被自动关掉才返回 —— 否则命令一跑完就退出，没人执行「到期杀内核」那一步，内核会一直挂着，正是本插件要消灭的情况。
 
 ### 游戏闸门插在哪
@@ -585,12 +599,12 @@ const SEP = '\\\\\\\\?';   // 一个或两个字面反斜杠都认
 - **Windows 优先。** 内核资产名目前写死 `mihomo-windows-amd64`。换平台需要改 `lib/index.js` 的 `prepareKernel()`。
 - **首次要联网下内核**（约 61MB）。下好之后缓存在 `runtime/`，之后离线可用。
 - **端口被占时不自启。** 这是刻意的：宁可复用别人已经开着的代理，也不去抢端口。
-- **`settings.json` 与 `config.yaml` 分开存。** 换订阅不会丢你的开关和端口设置，但反过来，手动改 `config.yaml` 不会同步进界面显示的「节点数」以外的字段。
+- **`settings.state` 与 `config.yaml` 分开存。** 换订阅不会丢你的开关和端口设置，但反过来，手动改 `config.yaml` 不会同步进界面显示的「节点数」以外的字段。
 - **游戏检测基于场景推断，不看软件身份。** 这是刻意的（见[游戏检测](#游戏检测)），代价是某些程序的无边框全屏会被误判成游戏。误判只是本次不启动代理，不会影响游戏本身；也可以把那个程序加进[白名单](#白名单由你自己填)。
 - **探测进程需要 `csc.exe`。** 用的是 Windows 自带的 .NET Framework 编译器（`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`），不需要装 SDK。极端精简的系统上若缺失，闸门会退化成「检测失败 → 放行」。
 - **礼让检测只看端口，不看软件身份。** 也是刻意的（见[礼让其它代理](#礼让其它代理)）。覆盖不到「代理软件开着但还没监听端口」和「TUN 模式不监听端口」两种情况；这种情况下本插件会照常启动，但因为那个代理还在，命令实际走的仍是对方。
 - **只测过 Windows 10/11 x64 + DSH 0.2.0-rc.2。**
-- **会接管系统代理（可关）。** 内核起来时默认把 Windows 系统代理指到本地端口上，这是大多数人对「开了代理」的预期。原设置会备份到 `runtime/proxy-backup.json`，关闭时逐字段写回（**包括 `ProxyEnable=0`** ——你原本没开，关掉后也不会替你开着）。你要是自己开着 FlClash，插件**只报告不覆盖**。不想要这个行为就把设置里的「允许本插件管理 Windows 系统代理」关掉。
+- **会接管系统代理（可关）。** 内核起来时默认把 Windows 系统代理指到本地端口上，这是大多数人对「开了代理」的预期。原设置会备份到 `runtime/proxy-backup.state`，关闭时逐字段写回（**包括 `ProxyEnable=0`** ——你原本没开，关掉后也不会替你开着）。你要是自己开着 FlClash，插件**只报告不覆盖**。不想要这个行为就把设置里的「允许本插件管理 Windows 系统代理」关掉。
 
 ### 一个被推翻的误判：测速目标
 
@@ -612,7 +626,7 @@ const SEP = '\\\\\\\\?';   // 一个或两个字面反斜杠都认
 
 几个不那么显然的决定：
 
-**界面不依赖 `settings` 服务。** 常规做法是宿主侧 `ctx.settings.installSection(ctx, NS, Config, defaults, hooks)`，其中 `Config` 是 `@deepseek-ai/schemastery` 的 `z.object({...})`。但 profile 侧经常解析不到 `schemastery`（本机就是：包里只有 `LICENSE`/`package.json`/`README.md`，**没有 `lib`**）。导出非 schema 对象会让 loader 投影 config 时报错。所以本插件的界面全部走自己的 HTTP 端点，宿主侧只读写 `settings.json`。
+**界面不依赖 `settings` 服务。** 常规做法是宿主侧 `ctx.settings.installSection(ctx, NS, Config, defaults, hooks)`，其中 `Config` 是 `@deepseek-ai/schemastery` 的 `z.object({...})`。但 profile 侧经常解析不到 `schemastery`（本机就是：包里只有 `LICENSE`/`package.json`/`README.md`，**没有 `lib`**）。导出非 schema 对象会让 loader 投影 config 时报错。所以本插件的界面全部走自己的 HTTP 端点，宿主侧只读写 `settings.state`。
 
 **不导出 Config schema。** 同上原因。
 
@@ -678,7 +692,7 @@ node test/selftest.mjs             # 端到端：导入配置 → 下内核 → 
 `test/client-render-test.mjs` 用一个最小 React 替身把 `lib/client.js` 的组件
 在「数据未到位 / 数据到位 / 出错」三种状态下各渲染一遍，**不联网、不下内核**。
 它抓的是两类静默失败：注册到不存在的 slot（宿主不报错，界面只是不出现）、
-以及 `settings.json` 被手工改坏后渲染期抛异常（`subscriptionUrl: null` 会让
+以及 `settings.state` 被手工改坏后渲染期抛异常（`subscriptionUrl: null` 会让
 `subInput.trim()` 抛 `Cannot read properties of null`）。输入数据用的是宿主
 `/dsh-proxy/status` 与 `/settings` 的实测返回形状。
 

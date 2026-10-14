@@ -14,7 +14,7 @@ English | [中文](README.md)
 | **`dsh-proxy-on-demand`** — on-demand proxy, auto-shutdown (this repo) |
 | [`dsh-hot-reloader`](https://github.com/xfgil/dsh-hot-reloader) — edit plugin source without restarting |
 | [`dsh-session-clock`](https://github.com/xfgil/dsh-session-clock) — per-session clock and idle gaps |
-| [`dsh-onebot-guard`](https://github.com/xfgil/dsh-onebot-guard) — QQ channel outbound gate |
+| [`dsh-onebot-companion`](https://github.com/xfgil/dsh-onebot-companion) — QQ channel all-in-one: outbound gate, rules, rhythm, persona, voice |
 
 > [!IMPORTANT]
 > **The first run downloads the kernel automatically.** This plugin ships **no**
@@ -468,7 +468,7 @@ ordinary error is 1).
 
 ## Configuration
 
-The plugin's own settings live in `<plugin>/runtime/settings.json`:
+The plugin's own settings live in `<plugin>/runtime/settings.state`:
 
 ```json
 {
@@ -510,13 +510,27 @@ The `runtime/` directory (excluded by `.gitignore`) holds runtime artifacts:
 | `mihomo.exe` | the kernel (downloaded on first use) |
 | `config.yaml` | the config handed to the kernel |
 | `providers/rules/` | rule-provider files |
-| `settings.json` | the user settings above |
+| `settings.state` | the user settings above |
 | `core.pid` | PID of the current kernel (used only to kill our own) |
-| `lease.json` | the lease — "in use until" |
-| `busy.json` | the busy lock — "which long command is using it" (liveness by PID) |
+| `lease.state` | the lease — "in use until" |
+| `busy.state` | the busy lock — "which long command is using it" (liveness by PID) |
 | `gameprobe.exe` / `gameprobe.cs` | the resident probe process for game detection (compiled on first use) |
-| `proxy-backup.json` | **your original system-proxy settings**, saved before the plugin takes over (written back field by field) |
+| `proxy-backup.state` | **your original system-proxy settings**, saved before the plugin takes over (written back field by field) |
 | `core.log` | kernel log |
+
+> **Why are the state files `.state` and not `.json`?**
+>
+> The host watches the plugin directory, and its plugin watcher **only reacts to `.json`** (a 21-extension matrix measured on 2026-10-14: `.state`/`.log`/`.txt`/`.dat`/`.lock`/`.yaml`/`.pid`… none of them trigger, **only `.json` does** — including `.json` inside subdirectories). One trigger means a full hot reload: **the old instance is disposed first, then the new one is applied**.
+>
+> So as long as a state file is named `.json`, every write rebuilds the plugin. The nastiest chain was:
+>
+> 1. You click "enable system proxy" → the plugin writes `proxy-backup.json` (a backup of your original settings);
+> 2. **That single write triggers a hot reload**;
+> 3. The new instance reads the registry while the old instance's `powershell` call is still running (measured ~700ms) → it concludes "the system proxy is not ours" → it deletes the backup that was just written;
+> 4. Only afterwards does the registry flip to "enabled" — **proxy on, backup gone**;
+> 5. Now you can never turn it off: the disable path finds no backup and can only answer "we never changed it".
+>
+> Renaming to `.state` means the hot reload **never happens at all**, so the race disappears at its root rather than being dodged by a patch. Leftover `.json` files from older versions are migrated automatically on startup (`migrateStateFiles()`) and then deleted — keeping them around would keep triggering hot reloads.
 
 ## HTTP API
 
@@ -576,10 +590,10 @@ Blocked by the peer gate it's a 409 as well, with `reason` set to `peer-running`
 ### Auto-shutdown: lease + guard
 
 ```
-any use ──renew()──> write lease.json { deadline: now + idleMs }
+any use ──renew()──> write lease.state { deadline: now + idleMs }
                           │
 guard timer (every 15s) ──┘
-   a command holds the busy lock? ──yes──> never shut down (busy.json, liveness by PID)
+   a command holds the busy lock? ──yes──> never shut down (busy.state, liveness by PID)
         │no
    deadline passed? ──no──> keep sleeping
         │yes
@@ -597,7 +611,7 @@ Four deliberate decisions:
    FlClash open), the plugin does not start a kernel; it marks the state
    `external`, keeps working, and **will not** shut down a process it doesn't own.
 3. **A long command holds the busy lock.** When `dsh-proxy -- <command>` runs, it
-   writes `busy.json` (holding its own PID) and keeps renewing the lease. While
+   writes `busy.state` (holding its own PID) and keeps renewing the lease. While
    that lock is held, `checkIdle()` never touches the kernel — otherwise a command
    that outlives `idleMs` (`npm install`, `git clone`, …) would be cut off
    mid-flight by the plugin's own guard, showing up as `ConnectionReset`. If the
@@ -753,7 +767,7 @@ redistribute this plugin, note that **downloading** a GPL-3.0 program and
 - **First run needs network** (~61 MB). Afterwards it's cached in `runtime/` and works offline.
 - **It won't start when the port is taken.** Deliberate: better to reuse a proxy
   someone already has running than to fight over the port.
-- **`settings.json` and `config.yaml` are stored separately.** Changing the
+- **`settings.state` and `config.yaml` are stored separately.** Changing the
   subscription won't lose your switches and port settings; conversely, editing
   `config.yaml` by hand won't sync into the UI beyond the node count.
 - **Game detection infers from the situation, not the software's identity.** This
@@ -777,7 +791,7 @@ redistribute this plugin, note that **downloading** a GPL-3.0 program and
 - **Takes over the system proxy (can be turned off).** When the kernel comes up it
   points the Windows system proxy at the local port by default, which is what most
   people mean by "the proxy is on". Your original settings are backed up to
-  `runtime/proxy-backup.json` and written back field by field when it's turned off
+  `runtime/proxy-backup.state` and written back field by field when it's turned off
   (**including `ProxyEnable=0`** — if you hadn't turned it on, it won't leave it on
   for you). If you run FlClash yourself, the plugin **reports without overriding**.
   Turn off "let this plugin manage the Windows system proxy" in settings to disable
@@ -824,7 +838,7 @@ where `Config` is a `z.object({...})` from `@deepseek-ai/schemastery`. But
 package has `LICENSE`/`package.json`/`README.md` but **no `lib`**). Exporting a
 non-schema object makes the loader throw while projecting config. So the UI talks
 to the plugin's own HTTP endpoints, and the host side just reads and writes
-`settings.json`.
+`settings.state`.
 
 **No `Config` schema is exported.** Same reason.
 
@@ -931,7 +945,7 @@ exactly, with no need to actually stand up a fake proxy.
 React stand-in in three states — data not yet loaded, data loaded, and errored —
 **with no network access and no kernel download**. It catches two classes of silent
 failure: registering into a nonexistent slot (the host reports nothing; the UI just
-never appears), and a render-time throw after `settings.json` is hand-edited into a
+never appears), and a render-time throw after `settings.state` is hand-edited into a
 bad shape (`subscriptionUrl: null` makes `subInput.trim()` throw
 `Cannot read properties of null`). Its fixtures mirror the real response shapes of
 the host's `/dsh-proxy/status` and `/settings`.
