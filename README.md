@@ -14,6 +14,7 @@
 | **`dsh-proxy-on-demand`** — 按需代理，用完自动关（本仓库） |
 | [`dsh-hot-reloader`](https://github.com/xfgil/dsh-hot-reloader) — 改完插件源码不用重启 |
 | [`dsh-session-clock`](https://github.com/xfgil/dsh-session-clock) — 按会话授时与空闲间隔 |
+| [`dsh-second-opinion`](https://github.com/xfgil/dsh-second-opinion) — 卡住时把问题交给另一个独立会话，要一份第二意见 |
 | [`dsh-onebot-companion`](https://github.com/xfgil/dsh-onebot-companion) — QQ 通道一体化：出站沉默守卫 / 行为规则 / 对话节奏 / 人设 / 语音 |
 
 > [!IMPORTANT]

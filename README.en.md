@@ -14,6 +14,7 @@ English | [中文](README.md)
 | **`dsh-proxy-on-demand`** — on-demand proxy, auto-shutdown (this repo) |
 | [`dsh-hot-reloader`](https://github.com/xfgil/dsh-hot-reloader) — edit plugin source without restarting |
 | [`dsh-session-clock`](https://github.com/xfgil/dsh-session-clock) — per-session clock and idle gaps |
+| [`dsh-second-opinion`](https://github.com/xfgil/dsh-second-opinion) — hand a stuck problem to another session for a second opinion |
 | [`dsh-onebot-companion`](https://github.com/xfgil/dsh-onebot-companion) — QQ channel all-in-one: outbound gate, rules, rhythm, persona, voice |
 
 > [!IMPORTANT]
