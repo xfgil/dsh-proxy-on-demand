@@ -69,6 +69,13 @@ It wraps [mihomo](https://github.com/MetaCubeX/mihomo) (the Clash.Meta core):
   kernel and cleans up its state files.
 - **Holds nothing in between** — no resident process, port 7890 is free, and it
   never fights with the Clash/FlClash you run yourself.
+- **The system proxy is your call** — the panel has **two independent switches**:
+  Proxy kernel and Windows system proxy. The kernel binds `127.0.0.1` only, so
+  starting or stopping it leaves your network untouched; whether global traffic
+  goes through it is something you flip. Your original settings are backed up
+  before the plugin touches the system proxy, and written back field by field.
+- **A node panel is built in** — no need to open another client: list groups,
+  list nodes, switch nodes (with a read-back confirmation), test latency in one click.
 - **No meddling while you game** — a detected fullscreen game keeps the proxy
   off, leaving your network untouched (see [Game detection](#game-detection)).
 - **Never fights another proxy** — when you already have FlClash or similar
@@ -232,7 +239,7 @@ to bottom:
 
 | Switch | On = | Off = |
 |---|---|---|
-| **Proxy kernel** | start mihomo (~0.5 s; the first run downloads the kernel) | stop the kernel, and restore the system proxy exactly |
+| **Proxy kernel** | start mihomo (~0.5 s; the first run downloads the kernel) | stop the kernel; if the system proxy still points at us, restore it exactly |
 | **Windows system proxy** | send global traffic through the local kernel | browsers go direct (the kernel stays up) |
 
 Keeping these apart is deliberate: **the kernel only listens on `127.0.0.1`, so
@@ -262,8 +269,22 @@ one time), so it had little diagnostic value and was easily misread as "the
 network is broken".
 
 The test target is **whatever `url:` each group already configures** (usually
-the provider's `gstatic/generate_204`); the plugin does not rewrite it — see the
-corrected misdiagnosis under [Known limitations](#known-limitations).
+the provider's `gstatic/generate_204`); when a group configures none — most
+**manual-select groups** don't — it falls back to a domestically reachable
+`generate_204`. The plugin **never rewrites the target inside your config file** —
+see the corrected misdiagnosis under [Known limitations](#known-limitations), plus
+the more important implementation detail below.
+
+> **Why can't we just let the kernel "use the group's own url"?** Established
+> 2026-10-14: mihomo's **Selector does not override `URLTest()`**. When the delay
+> endpoint is called without a `url`, it passes the empty string straight down →
+> `urlToMetadata("")` says "scheme not Support" → **every member of the group fails**
+> and the endpoint returns `504 all proxies timeout` within 4 ms. And the "test
+> latency" button operates on the first Selector. So the plugin now **resolves the
+> target itself and always passes it**: the group's own `testUrl` when it has one,
+> otherwise the fallback `generate_204`. Automatic groups
+> (URLTest/Fallback/LoadBalance) ignore the passed url and keep using their own, so
+> this is harmless for them.
 
 **Nodes** — three ways to supply a config:
 
@@ -796,14 +817,19 @@ redistribute this plugin, note that **downloading** a GPL-3.0 program and
   but since that other proxy is still there, your commands actually keep going
   through it.
 - **Tested only on Windows 10/11 x64 + DSH 0.2.0-rc.2.**
-- **Takes over the system proxy (can be turned off).** When the kernel comes up it
-  points the Windows system proxy at the local port by default, which is what most
-  people mean by "the proxy is on". Your original settings are backed up to
-  `runtime/proxy-backup.state` and written back field by field when it's turned off
-  (**including `ProxyEnable=0`** — if you hadn't turned it on, it won't leave it on
-  for you). If you run FlClash yourself, the plugin **reports without overriding**.
-  Turn off "let this plugin manage the Windows system proxy" in settings to disable
-  the behaviour entirely.
+- **Takes over the system proxy — but only when you flip that toggle (corrected 2026-10-14).**
+  The panel has two independent switches: **Proxy kernel** and **Windows system proxy**.
+  Starting or stopping the kernel **never** touches the system proxy (the kernel binds
+  `127.0.0.1` only; with nobody using it, it is inert — starting it has no side effects).
+  Only you flipping "Windows system proxy" writes to the registry. Your original settings
+  are backed up to `runtime/proxy-backup.state` and written back field by field when it's
+  turned off (**including `ProxyEnable=0`** — if you hadn't turned it on, it won't leave it
+  on for you). If you run FlClash yourself, the plugin **reports without overriding**.
+  Turn off "let this plugin manage the Windows system proxy" in settings to stop it
+  touching the system proxy at all.
+  > The one exception is **retraction**: when the kernel stops and the system proxy still
+  > points at us, the plugin restores it — that is not deciding for you, it is preventing
+  > you from losing all network access (the proxy would point at a dead port).
 
 ### A misdiagnosis, corrected: the speed-test target
 
@@ -830,6 +856,16 @@ target**. The real cause of "everything times out" was a **DNS port conflict**
 (FlClash holding `1053`, so the kernel's DNS never came up → nothing resolved →
 every target timed out at once), fixed by `forceDnsPort()` switching ports — and
 unrelated to the test target.
+
+That said, those 12 samples used **automatic groups** (URLTest/Fallback/LoadBalance,
+which override `URLTest()` and use their own `url:`), so "passing url or not is
+equivalent" holds **for them but not for Selector**. The "test latency" button
+operates on the first **Selector**, and Selector does not override `URLTest()` —
+without a url it passes the empty string down, members fail one by one, and the
+endpoint returns `504 all proxies timeout`. That is the "everything times out"
+you saw that day. The fix is for `testGroupDelay()` to **resolve the target itself
+and always pass it** (the group's `testUrl` when present, otherwise
+`DEFAULT_TEST_URL`) — **still without rewriting a single line of your config file**.
 
 Likewise, a node's `history` is **not** bucketed by test URL — passing miui or
 gstatic both update the same top-level `history` the panel reads, so there is no
