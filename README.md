@@ -372,14 +372,20 @@ dsh-proxy --no-peer -- cmd   # 本次跳过礼让，强行启用
   "gameAllow": ["obs64.exe", "D:\\path\\to\\OBS\\obs64.exe"],
   "yieldToPeer": true,
   "systemProxy": true,
-  "resident": false,
-  "proxyOnStart": true
+  "resident": false
 }
 ```
 
 `blockOnGame` 默认 `true`（游戏运行时禁止启用代理），`stopOnGame` 默认 `false`（只拦新的，已有的不动），`gameAllow` 默认 `[]`（白名单只由用户自己填，插件不预置），`yieldToPeer` 默认 `true`（检测到其它代理时自动让路）。
 
-`systemProxy` 默认 `true`（允许插件开关 Windows 系统代理，关掉时会精确还原你的原设置）；`resident` 默认 **`false`** —— 也就是本插件原本的行为「**用完了自己关掉**」，把它打开才是常驻（不因空闲自动关闭，随 DSH 一起退出）；`proxyOnStart` 默认 `true`（内核起来时顺带打开系统代理）。
+`systemProxy` 默认 `true`（允许插件开关 Windows 系统代理，关掉时会精确还原你的原设置）；`resident` 默认 **`false`** —— 也就是本插件原本的行为「**用完了自己关掉**」，把它打开才是常驻（不因空闲自动关闭，随 DSH 一起退出）。
+
+> **系统代理只由面板上那枚开关控制**，内核起停不会动它（2026-10-14 更正）。
+> 早先版本有过一个默认开启的 `proxyOnStart`，让「内核一起来就把系统代理指过来」；
+> 那个键已删除。理由：内核只绑 `127.0.0.1`，起停没有副作用；系统代理是**全局**影响 ——
+> 一个无副作用的东西不该去自动触发一个有副作用的东西，何况那个行为在面板上没有开关，
+> 用户既看不见也关不掉。现在内核停了仍会**还原**系统代理，但那不是替你决定，
+> 而是收回插件自己留下的痕迹（指向死端口会让你整个上不了网）。
 
 `runtime/` 目录（已被 `.gitignore` 排除）里放的是运行期产物：
 

@@ -485,8 +485,7 @@ The plugin's own settings live in `<plugin>/runtime/settings.state`:
   "gameAllow": ["obs64.exe", "D:\\path\\to\\OBS\\obs64.exe"],
   "yieldToPeer": true,
   "systemProxy": true,
-  "resident": false,
-  "proxyOnStart": true
+  "resident": false
 }
 ```
 
@@ -500,8 +499,17 @@ automatically when another proxy is detected).
 turning it off restores your original settings exactly); `resident` defaults to
 **`false`** — i.e. the plugin's original behaviour, **shut down when done**. Turn
 it on for resident mode (never auto-shutdown when idle; exits with DSH).
-`proxyOnStart` defaults to `true` (turning the kernel on also turns the system
-proxy on).
+
+> **The system proxy is controlled solely by that toggle on the panel**; starting
+> or stopping the kernel never touches it (corrected 2026-10-14). Earlier versions
+> had a default-on `proxyOnStart` that pointed the system proxy at us as soon as
+> the kernel came up; that key has been removed. Why: the kernel binds only
+> `127.0.0.1`, so starting it has no side effects, whereas the system proxy is
+> **global** — something with no side effects should not automatically trigger
+> something that has them. That behaviour also had no switch on the panel, so the
+> user could neither see nor disable it. The kernel stopping still **restores**
+> the system proxy, but that is not deciding for you — it is retracting a trace the
+> plugin itself left behind (pointing at a dead port would cut off your network).
 
 The `runtime/` directory (excluded by `.gitignore`) holds runtime artifacts:
 
