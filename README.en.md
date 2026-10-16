@@ -43,8 +43,7 @@ English | [中文](README.md)
 - [Install](#install)
 - [Usage](#usage)
 - [Settings UI](#settings-ui)
-- [Game detection](#game-detection)
-- [Yielding to other proxies](#yielding-to-other-proxies)
+- [Borrowing an existing proxy](#borrowing-an-existing-proxy)
 - [Configuration](#configuration)
 - [HTTP API](#http-api)
 - [How it works](#how-it-works)
@@ -68,20 +67,22 @@ It wraps [mihomo](https://github.com/MetaCubeX/mihomo) (the Clash.Meta core):
   prepares a config and spawns the process.
 - **Shuts down when idle** — after 2 minutes of no use by default, it kills the
   kernel and cleans up its state files.
-- **Holds nothing in between** — no resident process, port 7890 is free, and it
+- **Holds nothing in between** — no resident process, its own port is free, and it
   never fights with the Clash/FlClash you run yourself.
-- **The system proxy is your call** — the panel has **two independent switches**:
-  Proxy kernel and Windows system proxy. The kernel binds `127.0.0.1` only, so
-  starting or stopping it leaves your network untouched; whether global traffic
-  goes through it is something you flip. Your original settings are backed up
-  before the plugin touches the system proxy, and written back field by field.
+- **Never fights another proxy — it borrows it.** When FlClash or anything similar
+  is already listening, the plugin sends its traffic **through that proxy** and
+  starts no process of its own (see
+  [Borrowing an existing proxy](#borrowing-an-existing-proxy)). Its own port is
+  **7899**, not the 7890 every Clash-family client defaults to, so starting it can
+  never take the port out from under your own client. The management API starts
+  looking at **19090** and DNS at **15353**, each then picking a free port — also
+  clear of FlClashCore's habitual `9090` and the `1053` it holds.
+- **Never touches your Windows proxy settings.** There is no system-proxy switch and
+  no registry write anywhere in the plugin: the kernel binds `127.0.0.1` only, and
+  traffic reaches it solely through `HTTP_PROXY` handed to a child process. Your
+  network environment is yours to configure.
 - **A node panel is built in** — no need to open another client: list groups,
   list nodes, switch nodes (with a read-back confirmation), test latency in one click.
-- **No meddling while you game** — a detected fullscreen game keeps the proxy
-  off, leaving your network untouched (see [Game detection](#game-detection)).
-- **Never fights another proxy** — when you already have FlClash or similar
-  running, it silently steps aside and starts no process of its own (see
-  [Yielding to other proxies](#yielding-to-other-proxies)).
 
 ## The problem it actually solves
 
@@ -200,14 +201,37 @@ curl -X POST http://127.0.0.1:19387/dsh-proxy/fetch \
 The plugin ships a `dsh-proxy` command that **does not need the host process**:
 
 ```bash
-dsh-proxy status                     # show status
-dsh-proxy prepare                    # download kernel + prepare config
+dsh-proxy status                     # show status (exit port, whether borrowing)
+dsh-proxy prepare                    # download kernel + prepare config (also moves 7890 / 1053 out of the way)
 dsh-proxy import-flclash             # import config from local FlClash
-dsh-proxy start                      # start kernel; waits until it auto-shuts down
-dsh-proxy stop                       # stop immediately
-dsh-proxy game                       # show game-detection result
+dsh-proxy peers                      # is there a proxy on this machine we can borrow?
+dsh-proxy start                      # start kernel (or borrow); waits until it auto-shuts down
+dsh-proxy stop                       # stop immediately (only what we started)
 dsh-proxy -- <command> [args...]     # run one command through the proxy
 ```
+
+`status` looks like this (with FlClash running on this machine). The field names
+stay Chinese because this *is* the real output:
+
+```
+运行时目录 : D:\Plugins\dsh-proxy-on-demand\runtime
+端口       : 7899
+空闲自动关 : 120 秒
+内核状态   : 未运行
+剩余计时   : -
+借道探测   : 可以借 127.0.0.1:7890（自己的内核不必起）
+配置       : 143 个节点，482 条规则
+```
+
+Three things to read off it:
+
+- `端口` is **our own kernel's** port, while `借道探测` answers a different
+  question — "if we actually needed it right now, could we borrow one?"
+- `status` **only probes ports; it never starts a kernel** (about 2ms). Looking at
+  the status should not quietly spawn a process as a side effect.
+- Once the plugin has actually acquired an exit — its own kernel running, or
+  borrowing someone else's — one more line appears: `出口端口`, and *that* is the
+  port `-- <cmd>` will really use.
 
 The last form is the common one:
 
@@ -215,59 +239,75 @@ The last form is the common one:
 dsh-proxy -- git clone https://github.com/some/repo
 dsh-proxy --idle 0 -- curl.exe -sS https://api.ipify.org    # shut down right after
 dsh-proxy --idle 600 -- npm install                          # stay up for 10 idle minutes
-dsh-proxy --no-gate -- curl.exe -sS https://api.ipify.org    # skip game detection, force it on
+dsh-proxy --no-borrow -- curl.exe -sS https://api.ipify.org  # insist on our own kernel
 ```
 
-The CLI is bound by the game gate too (otherwise `dsh-proxy -- ...` would bypass
-the whole protection); when it's blocked the exit code is **3**.
+The CLI goes through the same borrow logic as everything else: if something is
+already listening on a common proxy port, the command simply uses it and no kernel
+is started.
 
 It injects into the child process:
 
 | Variable | Value |
 |---|---|
-| `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` | `http://127.0.0.1:<port>` |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` | `http://127.0.0.1:<exit port>` |
 | `NO_PROXY` | `localhost,127.0.0.1,::1,192.168.*,10.*,172.16.*` |
 
 `NO_PROXY` matters — without it, even local services (like DSH's own 19387) would
 be routed through the proxy.
+
+Note "exit port" rather than "port": when borrowing, the port handed to the child is
+**the other proxy's**, not our own. See
+[Where the borrow hook sits](#where-the-borrow-hook-sits).
 
 ## Settings UI
 
 After installing, the Settings sidebar gains an "On-demand proxy" page. From top
 to bottom:
 
-**Status** — two switches, independent of each other:
+**Status** — one switch, plus a badge and a line of detail:
 
 | Switch | On = | Off = |
 |---|---|---|
-| **Proxy kernel** | start mihomo (~0.5 s; the first run downloads the kernel) | stop the kernel; if the system proxy still points at us, restore it exactly |
-| **Windows system proxy** | send global traffic through the local kernel | browsers go direct (the kernel stays up) |
+| **Proxy kernel** | start mihomo (~0.5 s; the first run downloads the kernel) | stop the kernel (only if it's ours) |
 
-Keeping these apart is deliberate: **the kernel only listens on `127.0.0.1`, so
-nobody is using it if you don't point anything at it; what actually changes your
-network environment is the system proxy.** So you can leave the kernel running
-with the system proxy off and just point `HTTP_PROXY` at it. The reverse is not
-allowed: turning the system proxy on first makes sure the kernel is up —
-pointing Windows at a port nobody is listening on would cut off your whole
-network, which is far worse than having no proxy.
+The switch is deliberately alone. **The plugin is a tool for the agent, not a proxy
+client for the user** — starting and stopping its own kernel is the only thing worth
+a control; everything else happens on its own or is configured once below. Two
+earlier generations of controls have been removed: the three big buttons (*start now*
+/ *stop* / *renew the idle timer*), and the Windows-system-proxy switch with its
+game-detection and peer-yielding sections below it.
 
-Next to the switches you get the kernel PID and port; in non-resident mode you
-also get "seconds left until auto-shutdown". Refreshes every 4 seconds.
+Next to the switch you get the kernel PID and the **exit port**, and in non-resident
+mode also "seconds left until auto-shutdown". Refreshes every 4 seconds.
 
-> If another program holds the system proxy (FlClash, say), the switch reads
-> "not taken over (held by another program)" and the plugin **reports it without
-> overriding** — it does not fight over your settings.
+The status line distinguishes the states that actually differ:
 
-**Node panel** — while the kernel runs, lists the nodes of the current group,
+| Badge | Meaning |
+|---|---|
+| *kernel running* | our own mihomo is up on its own port |
+| *port taken* | our own port is busy but **not** with our kernel — we reuse it and start nothing |
+| *kernel stopped* | nothing of ours is running |
+
+Below the badge there is always an **exit** line (`127.0.0.1:<exitPort>` — the port
+traffic is actually sent to), and when the plugin is borrowing it adds: *"another
+proxy is already running on this machine; the plugin borrows it, takes no port and
+starts no process."* The kernel switch itself reads "borrowed" and is disabled —
+there is nothing to start, the exit already exists. See
+[Borrowing an existing proxy](#borrowing-an-existing-proxy).
+
+**Node panel** — while a kernel is available, lists the nodes of the current group,
 name on the left and delay on the right, with `●` marking the one in use. A
 **Test delay** button at the top triggers a group-wide speed test; the list is a
 **fixed 8 rows per page** and scrolls beyond that.
 
 There is deliberately **no group dropdown**: groups all live in that one
 scrolling list. Speed testing is **delay only** — the connectivity test was
-dropped because in practice very few nodes passed it (only Hong Kong did, that
-one time), so it had little diagnostic value and was easily misread as "the
-network is broken".
+dropped *from this panel* because in practice very few nodes passed it (only Hong
+Kong did, that one time), so it had little diagnostic value and was easily misread
+as "the network is broken". The endpoint behind it (`POST /proxies/connectivity`)
+is still there for programmatic use — it is the panel's button that went away, not
+the capability.
 
 The test target is **whatever `url:` each group already configures** (usually
 the provider's `gstatic/generate_204`); when a group configures none — most
@@ -295,14 +335,14 @@ the more important implementation detail below.
 | Import from FlClash | Reads your local FlClash `config.yaml` and rewrites rule-provider absolute paths to relative ones |
 | Paste manually | Drop in a Clash/mihomo YAML directly |
 
-**Game detection** — shows the current system state
-(`SHQueryUserNotificationState`), the foreground program, and whether a game was
-detected; switches (*block enabling the proxy while a game runs* / *shut the
-kernel down too when a game is detected*) plus a *re-check now* button. See
-[Game detection](#game-detection) for details.
-
 **Parameters** — proxy port, idle timeout (seconds), enable/disable the plugin,
-and whether to auto-import FlClash on first run. Changes apply immediately.
+auto-import FlClash on first run, and resident mode (never auto-shutdown). Changes
+apply immediately.
+
+> The default port is **7899**, deliberately not 7890 — that is the Clash-family
+> default, and sharing it means the plugin's kernel can take 7890 first and lock
+> your own FlClash out of it. And when another proxy is already running, this port
+> isn't used at all (we borrow instead).
 
 > A port change needs a kernel restart: flip the **Proxy kernel** switch off and
 > back on.
@@ -311,130 +351,25 @@ The UI **does not go through DSH's `settings` service**; it reads and writes the
 settings file and talks to the plugin's own HTTP endpoints. See
 [Implementation notes](#implementation-notes) for why.
 
-## Game detection
+> **Nothing in this panel touches Windows.** There is no system-proxy switch, and no
+> code path that writes the registry. What the plugin changes on your machine is
+> exactly one thing: it may spawn a `mihomo.exe` process of its own, and it may kill
+> **that** process (never anyone else's — see
+> [Auto-shutdown: lease + guard](#auto-shutdown-lease-guard)).
 
-You don't want your network environment changed while you're gaming, so before
-**starting the kernel** the plugin takes a look at the system state: **if a game
-is detected, the proxy is not enabled**.
+## Borrowing an existing proxy
 
-### Only manages itself
+If a proxy is already running on your machine (FlClash, Clash Verge, v2rayN…), this
+plugin **borrows it**: it points its exits at that proxy's port and starts no kernel
+of its own — no port grabbed, no process spawned, your network environment left
+alone. It recovers automatically once that other proxy exits.
 
-There's a deliberate decision here: **the criteria never ask "which program is
-this"**.
-
-There is no built-in game list, and no built-in accelerator whitelist either —
-such a list can never be exhaustive, and any missing entry would let through
-exactly the scenarios that should be blocked. The criteria ask one thing only:
-**does this situation look like playing a game in fullscreen**.
-
-The price is the occasional false positive (a borderless-fullscreen window taken
-for a game). But the consequence is merely that the proxy plugin doesn't start
-this once; the game itself is untouched — flip the switch off temporarily, add
-the program to the whitelist, or add `--no-gate` on the command line, and you're
-through.
-
-### Whitelist (filled in by you)
-
-What's above means **the plugin preloads no list of its own**. But you may well
-need exceptions yourself (say a remote-control tool, a screen recorder, or a
-borderless video player gets taken for a game in fullscreen), so there is a
-**user whitelist** — **empty by default, filled in only by you**.
-
-| How to fill it | How it matches |
-|---|---|
-| `obs64.exe` | by **process name**, case-insensitive |
-| `D:\path\to\OBS\obs64.exe` | by **full path** (forward slashes work too, case-insensitive) |
-
-Filling in the name is more durable (the name usually survives an upgrade that
-moves the program to a new directory), at the cost of **letting through every
-program with that name, whatever directory it lives in**; filling in the full
-path lets through only that one, but stops working once the path changes. Mixing
-the two is fine.
-
-When the whitelist hit is the **current foreground program**, neither criterion
-applies. The *add the current foreground program* button in the UI takes the
-foreground window as of the moment it probes — the easiest thing to click when a
-fullscreen window is misjudged.
-
-### Two criteria
-
-| Criterion | What it is | Source |
-|---|---|---|
-| **Primary** | system state ∈ {busy, exclusive fullscreen, presentation} | `SHQueryUserNotificationState` |
-| **Secondary** | the foreground window fills a whole monitor **and** has no caption, and is not a shell component | `GetForegroundWindow` + `GetWindowLong` + `MonitorFromWindow` |
-
-What makes the primary criterion meaningful: **Windows itself is saying "don't
-interrupt the user right now"**. Measured, it catches borderless fullscreen (not
-just exclusive D3D fullscreen) — popping a `FormBorderStyle=None` window that
-fills the screen moves QUNS from 5 (accepts notifications) to 2 (busy).
-
-The secondary criterion covers borderless fullscreen the system doesn't report.
-It must exclude shell components or it misfires: measured, with the `explorer.exe`
-desktop pulled to the foreground `caption=false, full=true`, so **the naive
-criterion takes it for a game** — while at that same moment QUNS=5, the system
-plainly saying "interruptible". That is exactly why **QUNS has to be the primary
-criterion**.
-
-`QUNS` values: `1=locked / 2=busy / 3=exclusive fullscreen / 4=presentation / 5=accepts notifications / 6=quiet time / 7=app-defined`. Only `2/3/4` block.
-
-### Blocks only new starts
-
-`ensureRunning()` returns a lease renewal directly when the kernel is already
-running, **without passing through the gate**. So:
-
-- If the proxy is **not running** when a game starts → starting is refused
-  (returns `409 Conflict`).
-- If the proxy is **already running** when a game starts → it's left alone, and
-  the download you have in flight is not interrupted.
-
-To make it "shut the proxy down the moment a game starts", turn on *shut the
-running proxy down when a game is detected* (`stopOnGame`) in Settings.
-
-### Fails open
-
-The probe won't start, compilation fails, it times out — in all those cases the
-gate **lets it through**. Better to let one slip than to have the detection
-machinery itself lock the proxy out for good.
-
-### The probe process
-
-Detection goes through a **resident child process**, `runtime/gameprobe.exe`
-(embedded C# source, compiled with Windows' own `csc.exe` — no SDK needed). The
-protocol is line-delimited JSON over stdin/stdout.
-
-Why keep it resident rather than spawning per call — measured numbers:
-
-| Approach | Cost per call |
-|---|---|
-| `Add-Type` compile every time | 480ms |
-| compile to an exe, spawn per call | 349ms |
-| compile to a DLL + `Assembly.LoadFrom` | 8ms |
-| **resident exe + stdin/stdout** | **0.5ms** (385ms cold start, paid once) |
-
-The UI polls every 4 seconds, and a verdict is cached for 3 seconds — so the real
-system-call rate is about once every 3 seconds.
-
-### Command line
-
-```bash
-dsh-proxy game                        # show the detection result: system state, foreground program, time taken
-dsh-proxy game --json                 # the same, as JSON
-dsh-proxy game list                   # list the whitelist
-dsh-proxy game allow obs64.exe        # add a program to the whitelist (for false positives)
-dsh-proxy game --allow-fg             # add the current foreground program to the whitelist
-dsh-proxy game unallow obs64.exe      # remove a program from the whitelist
-dsh-proxy --no-gate -- cmd            # skip detection for this run, force it on
-```
-
-When the gate blocks you the CLI exit code is **3** (as opposed to the ordinary
-1), so a script can tell "blocked by a game" from "it genuinely failed".
-
-## Yielding to other proxies
-
-If another proxy is already running on your machine (FlClash, Clash Verge,
-v2rayN…), this plugin **silently steps aside**: it starts no kernel of its own,
-grabs no port and leaves your network environment alone. It recovers
-automatically once that other proxy exits.
+> **This is the inverse of the old behaviour, and the inversion is the whole point.**
+> The plugin used to *yield*: on seeing another proxy it refused to start, which in
+> practice meant "the moment you open FlClash, this plugin stops working." The
+> original request (2026-10-16) was *"I don't want it fighting with Fl"* — and
+> borrowing is the best possible answer to that: there is nothing left to fight over,
+> and most of the time not a single process needs to be started.
 
 ### Ports only, not software identity
 
@@ -442,51 +377,59 @@ There is exactly one criterion: **is anyone listening on a common proxy port**.
 
 | | |
 |---|---|
-| Ports probed | 18: `7890-7893` (Clash/mihomo), `7897/7898` (Clash Verge Rev), `10808-10810` (v2rayN/xray), `1080/1081` (the usual SOCKS ports), `2080/2081` (sing-box), `20171/20172` (older Clash Verge), `8889` (Clash for Windows), `8118` (privoxy), `9910`, plus this plugin's own port |
-| Cost | about **2–3ms** for the whole concurrent probe (a connection refused on loopback is instantaneous) |
+| Ports probed | 18: `7890-7893` (Clash/mihomo), `7897/7898` (Clash Verge Rev), `10808-10810` (v2rayN/xray), `1080/1081` (the usual SOCKS ports), `2080/2081` (sing-box), `20171/20172` (older Clash Verge), `8889` (Clash for Windows), `8118` (privoxy), `9910` |
+| Cost | about **1–2ms** for the whole concurrent probe (a connection refused on loopback is instantaneous) |
+| Pick order | whichever port answers first in the list above; extra ports supplied by the caller take priority |
 
 Why not look at process names: this way it applies to any proxy software
 automatically, needs no maintained list of "who counts as a proxy", and can't miss
 one just because it isn't on the list. The price is two uncovered cases — proxy
 software that is open but hasn't started listening on a port yet, and TUN mode,
-which doesn't listen on a port at all. In those two cases this plugin starts as
-usual, but since that other proxy is still there, your commands actually keep
-going through it (see "Reuse when the port is taken" below).
+which doesn't listen on a port at all. In those two cases this plugin starts its own
+kernel as usual, which is the old behaviour rather than an error.
 
-### Must exclude your own kernel
+### The probe list must not contain our own port
 
-This plugin listens on `port` itself (7890 by default). If detection didn't
-exclude itself, the kernel would be taken for "another proxy" the moment it came
-up and would then **block itself forever**.
+This plugin listens on `port` itself (7899 by default). If that port were in the
+common-port list, the plugin would find **itself** and happily "borrow" a kernel it
+started — the worst case being the moment our own kernel is killed and the port
+hasn't been released yet: the plugin would borrow a dead port and every request
+would fail.
 
-So the verdict carries one hard rule: `port === ownPort && our own kernel is
-alive` → not someone else. `ownAlive` is computed by `core` and handed upward —
-because "is the listener on this port me" is something only core knows.
+So **7899 is deliberately absent from the 18 ports**, and the probe additionally
+always filters `p !== ownPort`. The two protections are independent on purpose —
+the filter is code, the missing entry is data, and the test suite pins both
+(`test/peers-test.mjs`, 21 checks).
 
-### Reuse when the port is taken, block only when it is free
+### Reuse when our own port is taken
 
-The gate only needs to speak up when we are **about to start our own kernel**. If
-7890 is already taken by someone else, `ensureRunning()` simply marks
-`external: true` and returns: commands work as usual (through the proxy that
-someone else already built), and we start not a single process. That is what
-"silently steps aside" looks like on the normal path.
+There is a second, separate case: our **own** port is busy but not with our kernel
+(someone else took 7899, or a stale process holds it). Then `ensureRunning()`
+simply marks the state `external` and reuses whatever is there — commands work as
+usual and no process is started. This is a fallback, not the main path.
 
 ### Fails open
 
-Same principle as the game gate: when probing errors out, let it through — better
-to start a kernel one extra time than to have a bug in the probing code make the
-proxy unusable for good.
+Same principle as everything else here: when probing errors out, let it through —
+better to start one extra kernel than to have a bug in the probing code make the
+proxy unusable for good. **There is no longer any path by which detection can refuse
+to start the proxy.** Borrowing is not a gate; it is a source of exits.
 
 ### Command line
 
 ```bash
 dsh-proxy peers              # show the detection result: which ports are taken, time taken
 dsh-proxy peers --json       # the same, as JSON
-dsh-proxy --no-peer -- cmd   # skip yielding for this run, force it on
+dsh-proxy --no-borrow -- cmd # skip borrowing for this run, insist on our own kernel
 ```
 
-When the peer gate blocks you the CLI exit code is **4** (the game gate is 3, an
-ordinary error is 1).
+Two exit codes are gone with the mechanisms behind them: **3** (blocked by a game)
+and **4** (blocked by another proxy). Borrowing cannot block, so the only non-zero
+code left is a plain **1** for a genuine failure.
+
+Borrowing is a **normal state, not an error** — no exit code, nothing blocked. The
+old behaviour ("stopped by the yielding gate → exit code 4") has been deleted along
+with the gate itself.
 
 ## Configuration
 
@@ -495,43 +438,35 @@ The plugin's own settings live in `<plugin>/runtime/settings.state`:
 ```json
 {
   "enabled": true,
-  "port": 7890,
+  "port": 7899,
   "idleMs": 120000,
   "subscriptionUrl": "",
   "autoImportFlClash": true,
   "configSource": "flclash",
   "lastSyncAt": 1760000000000,
-  "lastSyncNote": "已从 FlClash 导入（规则 44 条）",
-  "blockOnGame": true,
-  "stopOnGame": false,
-  "gameAllow": ["obs64.exe", "D:\\path\\to\\OBS\\obs64.exe"],
-  "yieldToPeer": true,
-  "systemProxy": true,
+  "lastSyncNote": "已从 FlClash 导入（143 个节点 / 482 条规则）",
   "resident": false
 }
 ```
 
-`blockOnGame` defaults to `true` (block enabling the proxy while a game runs),
-`stopOnGame` defaults to `false` (block new starts only; leave a running kernel
-alone), `gameAllow` defaults to `[]` (the whitelist is filled in by the user
-alone; the plugin preloads nothing), `yieldToPeer` defaults to `true` (step aside
-automatically when another proxy is detected).
+That is the whole schema — **nine keys**. The three game-detection keys
+(`blockOnGame` / `stopOnGame` / `gameAllow`), the old peer key (`yieldToPeer`) and the
+system-proxy key (`systemProxy`) no longer exist anywhere in the code, together with
+the mechanisms they configured. Unknown keys are discarded on read, so a stale
+`settings.state` carrying them simply loses them.
 
-`systemProxy` defaults to `true` (let the plugin switch the Windows system proxy;
-turning it off restores your original settings exactly); `resident` defaults to
-**`false`** — i.e. the plugin's original behaviour, **shut down when done**. Turn
-it on for resident mode (never auto-shutdown when idle; exits with DSH).
+`port` defaults to **7899**; `resident` defaults to **`false`** — i.e. the plugin's
+original behaviour, **shut down when done**. Turn `resident` on for resident mode
+(never auto-shutdown when idle; exits with DSH).
 
-> **The system proxy is controlled solely by that toggle on the panel**; starting
-> or stopping the kernel never touches it (corrected 2026-10-14). Earlier versions
-> had a default-on `proxyOnStart` that pointed the system proxy at us as soon as
-> the kernel came up; that key has been removed. Why: the kernel binds only
-> `127.0.0.1`, so starting it has no side effects, whereas the system proxy is
-> **global** — something with no side effects should not automatically trigger
-> something that has them. That behaviour also had no switch on the panel, so the
-> user could neither see nor disable it. The kernel stopping still **restores**
-> the system proxy, but that is not deciding for you — it is retracting a trace the
-> plugin itself left behind (pointing at a dead port would cut off your network).
+> **Old `7890` is migrated to `7899` on read.** Every existing user's
+> `settings.state` has `7890` in it, because that was the old default, and the
+> whitelist filter above would faithfully read it back — making the whole port
+> isolation pointless and reproducing the original complaint ("the moment the plugin
+> proxies, FlClash's kernel can't connect"). So a stored `7890` is rewritten to
+> `7899` (`readSettings()` in `lib/settings.js`). If you genuinely typed `7890` by
+> hand, it is migrated too — but that is precisely the value you want to avoid. The
+> migration is idempotent and lands on disk with the next `writeSettings()`.
 
 The `runtime/` directory (excluded by `.gitignore`) holds runtime artifacts:
 
@@ -544,9 +479,10 @@ The `runtime/` directory (excluded by `.gitignore`) holds runtime artifacts:
 | `core.pid` | PID of the current kernel (used only to kill our own) |
 | `lease.state` | the lease — "in use until" |
 | `busy.state` | the busy lock — "which long command is using it" (liveness by PID) |
-| `gameprobe.exe` / `gameprobe.cs` | the resident probe process for game detection (compiled on first use) |
-| `proxy-backup.state` | **your original system-proxy settings**, saved before the plugin takes over (written back field by field) |
 | `core.log` | kernel log |
+
+There is no `gameprobe.exe`, no `probe.js`, no `proxy-backup.state`. The plugin
+compiles nothing, runs no helper process, and keeps no copy of your system settings.
 
 > **Why are the state files `.state` and not `.json`?**
 >
@@ -554,13 +490,15 @@ The `runtime/` directory (excluded by `.gitignore`) holds runtime artifacts:
 >
 > So as long as a state file is named `.json`, every write rebuilds the plugin. The nastiest chain was:
 >
-> 1. You click "enable system proxy" → the plugin writes `proxy-backup.json` (a backup of your original settings);
+> 1. You flip a switch → the plugin writes `proxy-backup.json` (a backup of your original settings);
 > 2. **That single write triggers a hot reload**;
 > 3. The new instance reads the registry while the old instance's `powershell` call is still running (measured ~700ms) → it concludes "the system proxy is not ours" → it deletes the backup that was just written;
 > 4. Only afterwards does the registry flip to "enabled" — **proxy on, backup gone**;
 > 5. Now you can never turn it off: the disable path finds no backup and can only answer "we never changed it".
 >
 > Renaming to `.state` means the hot reload **never happens at all**, so the race disappears at its root rather than being dodged by a patch. Leftover `.json` files from older versions are migrated automatically on startup (`migrateStateFiles()`) and then deleted — keeping them around would keep triggering hot reloads.
+>
+> That whole chain is now historical: the plugin no longer writes `proxy-backup.*` at all, because it no longer touches the system proxy. The naming rule still stands for the files that remain.
 
 ## HTTP API
 
@@ -568,16 +506,15 @@ Everything listens on **loopback only** (`127.0.0.1` / `::1`); other origins get
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/dsh-proxy/status` | kernel running?, PID, seconds remaining, current system-proxy state |
+| GET | `/dsh-proxy/status` | kernel running?, PID, **exit port**, borrowing?, seconds remaining |
 | GET | `/dsh-proxy/settings` | read settings + current config summary |
 | POST | `/dsh-proxy/settings` | write settings |
-| GET | `/dsh-proxy/system-proxy` | current system-proxy state (ours? held by someone else?) |
-| POST | `/dsh-proxy/system-proxy` | `{"on":true\|false}` — switch the system proxy (makes sure the kernel is up first when turning it on) |
 | GET | `/dsh-proxy/proxies` | list groups and nodes (add `?fake=1` to include the informational pseudo-nodes) |
 | POST | `/dsh-proxy/proxies/select` | `{"group":"...","node":"..."}` — switch node, then **read back to confirm** |
 | POST | `/dsh-proxy/proxies/test` | `{"group":"...","timeoutMs":3000}` — test delay |
+| POST | `/dsh-proxy/proxies/connectivity` | `{"node":"..."\|"nodes":[...],"url"?}` — actually send one request through that node |
 | POST | `/dsh-proxy/prepare` | download kernel + prepare config |
-| POST | `/dsh-proxy/start` | start the kernel |
+| POST | `/dsh-proxy/start` | start the kernel (or borrow) |
 | POST | `/dsh-proxy/stop` | stop the kernel |
 | POST | `/dsh-proxy/renew` | renew the idle timer |
 | POST | `/dsh-proxy/config/from-subscription` | `{"url":"..."}` — fetch a subscription |
@@ -585,35 +522,27 @@ Everything listens on **loopback only** (`127.0.0.1` / `::1`); other origins get
 | POST | `/dsh-proxy/config/manual` | `{"text":"..."}` — write a config by hand |
 | GET | `/dsh-proxy/config/example` | get a template |
 | POST | `/dsh-proxy/fetch` | `{"url":"https://..."}` — fetch once through the proxy |
-| GET | `/dsh-proxy/game` | game-detection status (add `?force=1` to bypass the cache) |
-| POST | `/dsh-proxy/game/clear-cache` | clear the detection cache and re-check |
-| POST | `/dsh-proxy/game/allow` | add a whitelist entry; with no argument it takes the **current foreground program** |
-| POST | `/dsh-proxy/game/allow/remove` | `{"entry":"..."}` — remove an entry from the whitelist |
-| GET | `/dsh-proxy/peers` | peer-yield detection status (add `?force=1` to bypass the cache) |
-| POST | `/dsh-proxy/peers/clear-cache` | clear the peer-yield detection cache and re-check |
+| GET | `/dsh-proxy/peers` | what can we borrow (add `?force=1` to bypass the cache) |
+| POST | `/dsh-proxy/peers/clear-cache` | clear the borrow-detection cache and re-probe |
 
-When the game gate blocks you, `POST /start` and `POST /fetch` return
-**409 Conflict**:
+That is the complete surface. The two `/system-proxy` routes and the four `/game*`
+routes are gone; there is no `POST /system-proxy` to flip Windows proxy state,
+because the mechanism behind it was removed.
 
-```json
-{
-  "ok": false,
-  "blocked": true,
-  "reason": "game-running",
-  "error": "系统处于「忙碌」状态（game.exe），已按设置禁止启用代理。…"
-}
-```
+Two routes behave differently now:
 
-Blocked by the peer gate it's a 409 as well, with `reason` set to `peer-running`:
+- **`POST /start`** no longer reports "blocked". When another proxy is available it
+  returns `{"started":false,"borrowed":true,"port":<theirs>}` and a note; otherwise
+  it starts a kernel as before. Either way the response carries
+  `proxy: "http://127.0.0.1:<exitPort>"`.
+- **`POST /fetch`** sends the request to **`core.exitPort()`**, not to the
+  configured port — when borrowing, the exit is the *other* proxy's port. Getting
+  this wrong was the one real correctness bug the borrow rewrite had to fix; the
+  response tells you which it was (`via`, and `borrowed: true|false`).
 
-```json
-{
-  "ok": false,
-  "blocked": true,
-  "reason": "peer-running",
-  "error": "检测到其它代理正在运行（端口 10808 正在被监听），已按设置自动静默让路，不启动本插件的内核。…"
-}
-```
+There is no 409 branch left. A failure is a plain **500** with `{"ok":false,
+"error":"..."}`; the only other non-200 codes are 403 (non-loopback origin) and 413
+(body over 2 MB).
 
 > **`/fetch` always sends a `User-Agent`.** A real defect fixed on 2026-10-14: neither
 > branch sent **any** request header, so GitHub's REST API answered **403** every time
@@ -647,9 +576,12 @@ Four deliberate decisions:
 1. **Only kill the PID we started.** The state file records `core.pid`; it never
    kills by process name — that would risk killing the user's own FlClash or
    another mihomo.
-2. **Never fight for the port.** If 7890 is already listening (say the user has
-   FlClash open), the plugin does not start a kernel; it marks the state
-   `external`, keeps working, and **will not** shut down a process it doesn't own.
+2. **Never fight for the port.** If a common proxy port is already listening (say
+   the user has FlClash open), the plugin borrows that exit and starts no kernel of
+   its own — it **will not** shut down a process it doesn't own. A borrowed kernel
+   is never killed, and it is never used as a reason to renew a lease we don't own:
+   we have no standing to extend someone else's lifetime, and nothing of ours is
+   being held, so there is nothing to reclaim.
 3. **A long command holds the busy lock.** When `dsh-proxy -- <command>` runs, it
    writes `busy.state` (holding its own PID) and keeps renewing the lease. While
    that lock is held, `checkIdle()` never touches the kernel — otherwise a command
@@ -662,75 +594,59 @@ Four deliberate decisions:
    would exit and nobody would be left to run the "kill on expiry" step, leaving
    the kernel running, which is exactly what this plugin exists to prevent.
 
-### Where the gate hooks in
+### Where the borrow hook sits
 
-The gate hooks into the **kernel-start path** only; it never touches a kernel
-that's already running:
-
-```
-POST /start ─┐
-POST /fetch ─┼─> ensureAndStart() ─> core.ensureRunning()
-CLI -- cmd  ─┘                            │
-                                          kernel already running? ──yes──> renew lease and return (gate not consulted)
-                                               │no
-                                        gameGate() ──blocked──> throw GAME_BLOCKED ─> HTTP 409
-                                               │allowed
-                                          core.start()
-```
-
-`gate` and `gameWatch` are injected into `core` as **closure callbacks**, rather
-than having `core.js` `import games.js` directly — that way `core.js` only deals
-with process lifecycle, while the criteria and settings stay in the layer above,
-and can be tested on their own.
-
-The whitelist takes effect inside `evaluateGate()`: on a hit **neither criterion
-participates** (`hit` is simply `null`), rather than "decide first, then undo".
-That way there is only one explanation for "why wasn't this blocked", and the UI
-can tell you plainly whether the name or the path matched.
-
-The `stopOnGame` hook hangs off the guard's `checkIdle()` (after the busy-lock
-check, before the lease check): while a command holds the lock it never shuts
-down; otherwise a detected game takes the kernel down.
-
-### Where the peer gate hooks in
-
-The peer gate is a **sister mechanism** to the game gate — same position, same
-principle (block new starts only, fail open), but it **decides before the game
-gate does**:
+Acquisition is a four-step ladder, and **borrowing comes before anything is
+started**:
 
 ```
 POST /start ─┐
 POST /fetch ─┼─> ensureAndStart() ─> core.ensureRunning()
 CLI -- cmd  ─┘                            │
-                                          kernel already running? ──yes──> renew lease and return
+                                          our own kernel already alive? ──yes──> renew lease, return
                                                │no
-                                          port taken by someone else? ──yes──> mark external, reuse it, start no kernel
+                                          anything on a common proxy port? ──yes──> borrow it
+                                               │                                      (currentExitPort = theirs,
+                                               │                                       start no process)
                                                │no
-                                          peerGate() ──blocked──> throw PEER_BLOCKED ─> HTTP 409
-                                               │allowed
-                                          gameGate() ──blocked──> throw GAME_BLOCKED ─> HTTP 409
-                                               │allowed
+                                          our own port busy (not ours)? ──yes──> reuse it, start no kernel
+                                               │no
                                           core.start()
 ```
 
-The order matters: **yielding comes first**. If another proxy already holds the
-port, then "can we even start" is not a question the game state gets to answer;
-stepping aside first saves one system-state probe and makes the block reason the
-user sees more accurate.
+The order carries the meaning:
 
-`peerGate` is likewise injected into `core` as a closure callback, but with a
-different signature — it receives `{ ownAlive }`:
+- **Borrowing is first**, so the common case — the user already has a proxy running —
+  costs one port probe and **zero processes**. The old design could only reuse a peer
+  when the two ports happened to match, which in practice meant it almost never did;
+  now we go looking for one.
+- **Reuse of our own occupied port is a fallback**, kept for the custom configuration
+  where someone sets the plugin's port to 7890. With the default 7899 it essentially
+  never fires.
+- **Nothing here can refuse.** Every branch above produces an exit; the worst outcome
+  is starting one extra kernel.
+
+The borrow callback is injected into `core` as a **closure callback**
+(`borrowPort: borrowFn`) rather than having `core.js` `import peers.js` directly —
+that way `core.js` only deals with process lifecycle, while port policy and settings
+stay in the layer above and can be tested on their own. `test/peers-test.mjs` does
+exactly that: it feeds constructed probe results to the pure `evaluateBorrow()` and
+never stands up a real proxy.
+
+`core` exposes the result as `exitPort()` — `currentExitPort ?? cfg.port` — and
+**every consumer uses it**: the CLI's `HTTP_PROXY`, `POST /fetch`, the `proxy` field
+in `/start`'s response, and `core.status()`. That single accessor is what makes
+"borrowed" correct everywhere instead of only on the happy path.
+
+`core.status()` reports `exitPort`, `exitPortUp`, and
 
 ```js
-const peerGateFn = ({ ownAlive } = {}) => peerGate({
-  yieldToPeer: user.yieldToPeer !== false,
-  ownPort: user.port,
-  ownAlive: ownAlive === true,
-});
+borrowed: !alive && exitUp && ep !== this.cfg.port
 ```
 
-`ownAlive` has to be computed by `core` at that moment and passed down — the layer
-above (`index.js`) has no way to know whether the listener on 7890 is itself.
+— i.e. "our own kernel is not alive, but something is answering on a port that isn't
+ours, therefore we are borrowing". `alive` is computed by `core` at that moment: the
+layer above has no way to know whether the listener on our own port is ourselves.
 
 ### Kernel acquisition: self-contained download + unzip
 
@@ -805,42 +721,23 @@ redistribute this plugin, note that **downloading** a GPL-3.0 program and
 - **Windows first.** The kernel asset name is hard-coded to
   `mihomo-windows-amd64`. Porting means editing `prepareKernel()` in `lib/index.js`.
 - **First run needs network** (~61 MB). Afterwards it's cached in `runtime/` and works offline.
-- **It won't start when the port is taken.** Deliberate: better to reuse a proxy
-  someone already has running than to fight over the port.
+- **It borrows rather than fights.** If a proxy is already listening on one of the
+  common ports, this plugin uses it and starts nothing. Only when nothing is there
+  does it bring up its own kernel — on **7899**, not 7890, so the two can coexist.
 - **`settings.state` and `config.yaml` are stored separately.** Changing the
   subscription won't lose your switches and port settings; conversely, editing
   `config.yaml` by hand won't sync into the UI beyond the node count.
-- **Game detection infers from the situation, not the software's identity.** This
-  is deliberate (see [Game detection](#game-detection)); the price is that some
-  programs' borderless fullscreen gets taken for a game. A false positive only
-  means the proxy doesn't start this once, and never affects the game itself; you
-  can also add that program to the
-  [whitelist](#whitelist-filled-in-by-you).
-- **The probe process needs `csc.exe`.** It uses the .NET Framework compiler that
-  ships with Windows
-  (`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`) — no SDK required.
-  On an extremely stripped-down system where it's missing, the gate degrades to
-  "detection failed → let it through".
-- **Peer detection looks at ports only, not software identity.** Also deliberate
-  (see [Yielding to other proxies](#yielding-to-other-proxies)). It doesn't cover
-  the two cases of "proxy software is open but not listening on a port yet" and
-  "TUN mode, which listens on no port"; in those cases this plugin starts as usual,
-  but since that other proxy is still there, your commands actually keep going
-  through it.
+- **Borrow detection looks at ports only, not software identity.** Deliberate (see
+  [Borrowing an existing proxy](#borrowing-an-existing-proxy)). It doesn't cover the
+  two cases of "proxy software is open but not listening on a port yet" and "TUN mode,
+  which listens on no port"; in those cases this plugin starts its own kernel as usual.
+  That is not a failure — it just means one more `mihomo.exe` than strictly necessary,
+  and with TUN mode in play the traffic is captured by that other proxy anyway.
 - **Tested only on Windows 10/11 x64 + DSH 0.2.0-rc.2.**
-- **Takes over the system proxy — but only when you flip that toggle (corrected 2026-10-14).**
-  The panel has two independent switches: **Proxy kernel** and **Windows system proxy**.
-  Starting or stopping the kernel **never** touches the system proxy (the kernel binds
-  `127.0.0.1` only; with nobody using it, it is inert — starting it has no side effects).
-  Only you flipping "Windows system proxy" writes to the registry. Your original settings
-  are backed up to `runtime/proxy-backup.state` and written back field by field when it's
-  turned off (**including `ProxyEnable=0`** — if you hadn't turned it on, it won't leave it
-  on for you). If you run FlClash yourself, the plugin **reports without overriding**.
-  Turn off "let this plugin manage the Windows system proxy" in settings to stop it
-  touching the system proxy at all.
-  > The one exception is **retraction**: when the kernel stops and the system proxy still
-  > points at us, the plugin restores it — that is not deciding for you, it is preventing
-  > you from losing all network access (the proxy would point at a dead port).
+- **It never touches your Windows proxy settings (changed 2026-10-16).** There is no
+  system-proxy toggle any more, and no code that writes the registry: the kernel binds
+  `127.0.0.1` only, and with nobody using it, it is inert. Pointing a browser or a
+  game at the proxy is your call, not the plugin's.
 
 ### A misdiagnosis, corrected: the speed-test target
 
@@ -867,6 +764,11 @@ target**. The real cause of "everything times out" was a **DNS port conflict**
 (FlClash holding `1053`, so the kernel's DNS never came up → nothing resolved →
 every target timed out at once), fixed by `forceDnsPort()` switching ports — and
 unrelated to the test target.
+
+> The start port for that search moved from `1053` to **`15353`** in the 2026-10-16
+> cleanup (`forceDnsPort(text, startPort = 15353)` in `lib/config.js`). `1053` was
+> the wrong end of the range to scan from: it is the port Clash-family cores grab
+> first, so the very first candidate was the one most likely to be occupied.
 
 That said, those 12 samples used **automatic groups** (URLTest/Fallback/LoadBalance,
 which override `URLTest()` and use their own `url:`), so "passing url or not is
@@ -954,47 +856,29 @@ plaintext proxy port fails with `Client network socket disconnected before secur
 TLS connection was established` — that's a usage error, not a broken proxy.
 `proxyGet()` in `lib/index.js` implements the CONNECT tunnel by hand.
 
-**A resident child process keeps Node from exiting.** The probe process started by
-`lib/probe.js` holds the stdio pipes, so the event loop never empties — a short
-command (`dsh-proxy game`) finishes but doesn't exit, looking like a hang.
-`bin/dsh-proxy.mjs` explicitly `await disposeProbe()`s at the end of the script.
-
-**Three P/Invoke traps.** All hit while writing the embedded C# in `lib/probe.js`:
-
-- `GetMonitorInfoW` / `GetWindowTextW` / `QueryFullProcessImageNameW` **must**
-  spell out `EntryPoint = "...W"` or `CharSet = CharSet.Unicode` — the default
-  looks for the `*A` versions, and **these functions have no A version at all**,
-  so it throws `EntryPointNotFoundException` at runtime.
-- Read window styles with `GetWindowLongW`, not `GetWindowLongPtrW`.
-- `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION (0x1000)` is enough to get
-  the process path, no elevation required.
-
 ## Development
 
 ```bash
 node --check lib/index.js          # syntax check
-node test/games-test.mjs           # game-detection rules (offline, 61 checks, pure function fed fixture data)
-node test/peers-test.mjs           # peer-yield rules (offline, 26 checks, pure function fed fixture data)
-node test/client-render-test.mjs   # client UI rendering (offline, 37 checks, no kernel needed)
+node test/peers-test.mjs           # borrow rules (offline, 21 checks, pure function fed fixture data)
+node test/client-render-test.mjs   # client UI rendering (offline, 44 checks, no kernel needed)
 node test/dl-test.mjs              # kernel download only (fast)
 node test/busy-test.mjs            # busy-lock regression: kernel must survive a command longer than idleMs
 node test/selftest.mjs             # end-to-end: import config → download → start → go abroad → idle shutdown
 ```
 
-`test/games-test.mjs` manages to be fully offline because the decision core,
-`evaluateGate()`, was deliberately factored out as a **pure function** — it takes
-a "probe frame" object and returns a verdict, never touching the real system. So
-covering edges like a fullscreen explorer desktop, a fullscreen IME host, a failed
-probe or missing fields needs none of those situations to actually be staged. The
-23 whitelist checks live here too: name matching / path matching / case / forward
-slashes / filling in a name alone lets through same-named programs in other
-directories / neither criterion participates on a hit / dirty input doesn't crash.
-
-`test/peers-test.mjs` works the same way: its decision core, `evaluatePeers()`, is
-a pure function fed constructed port-probe results. So the two key branches — "a
-listener on our own port held by our own kernel doesn't count as someone else"
-and "the same port, but we're not alive, so it is someone else" — are covered
-exactly, with no need to actually stand up a fake proxy.
+`test/peers-test.mjs` is fully offline because its decision core, `evaluateBorrow()`,
+was deliberately factored out as a **pure function**: it takes constructed port-probe
+results and returns a verdict, never touching the real system. The branches that
+matter are covered exactly — "every common port is down, so there is nothing to
+borrow", "7890 answers, so borrow 7890 and say so in the note", "**our own port is
+never borrowable**, or we would borrow from ourselves", "the first live port in list
+order wins, regardless of the order the results arrive in", "caller-supplied extra
+ports outrank the built-in list", "garbage input doesn't crash" — plus the 5 checks
+that pin down the port list itself: it must contain the mainstream proxy ports, must
+not contain **7899** (our own port), must have no duplicates, must be all valid port
+numbers, and must not contain **9090** (FlClashCore's controller port, which is an
+API, not a proxy).
 
 `test/client-render-test.mjs` renders `lib/client.js`'s component through a minimal
 React stand-in in three states — data not yet loaded, data loaded, and errored —
@@ -1010,26 +894,66 @@ that takes 10 seconds, the guard used to kill the kernel at second 3 and the
 command's last step failed with `ConnectionReset`. All 6 checks now pass (the
 command gets an exit IP, the kernel shuts down on policy, the busy lock is released).
 
-`test/selftest.mjs` runs the whole chain against **your real FlClash config**,
-with 14 checks:
+It is also the one test whose assumptions shift under borrowing: if a proxy really is
+listening on `127.0.0.1:7890` when you run it, the CLI borrows it and no `core.pid` is
+ever written — so check 4 ("the kernel was auto-shut-down") passes vacuously. Run it
+with `--no-borrow` in the args if you want to be sure you exercised the kernel path.
+
+`test/selftest.mjs` runs the whole chain against **your real FlClash config**. It is
+the only test that touches the network and the real kernel, so it prints a lot; the
+core of a passing run looks like this (the check names are Chinese because this is
+the literal output):
 
 ```
-PASS  1  found local FlClash config
-PASS  2  detected absolute rule-provider paths  (44 found, 44 copied)
-PASS  2b all absolute paths rewritten to relative  (0 left)
-PASS  2c relative paths written  (44/44)
-PASS  2d rule files copied into place
-PASS  3  fetched latest kernel version  (v1.19.32)
-PASS  3b kernel downloaded and unpacked  (61MB)
-PASS  4  kernel started  (pid=8524, 564ms)
-PASS  4b port is listening  (port=7891)
-PASS  5  can connect to the proxy port
-PASS  5b traffic goes abroad through the kernel (CONNECT tunnel)  (HTTP 200 ip=42.200.172.28)
-PASS  6  kernel PID recorded  (pid=8524)
-PASS  6b auto-shutdown after idle  (pid=8524 alive=false)
-PASS  6c lease file cleaned up
-RESULT: 14/14 passed
+PASS  0a 内置模板的默认端口是 7899 而不是 7890
+PASS  0b 内置模板不含 7890
+PASS  0c DNS 起始端口不再是 1053
+PASS  0c2 onlyIfPorts：安全端口不被无谓重挑  (changed=false)
+PASS  0c3 onlyIfPorts：命中 1053 时照样修  (port=15353)
+PASS  0d ★ 导入配置里的 7890 被换成 7899
+PASS  0i ★ 旧设置文件里的 port: 7890 被迁到 7899  (port=7899)
+PASS  1 找到本机 FlClash 配置  (C:\Users\...\com.follow\clash\config.yaml)
+PASS  2 识别出 rule-provider 绝对路径  (共 44 条，新拷 44)
+PASS  2b 绝对路径已全部改为相对路径  (残留 0 处)
+PASS  2c 相对路径已写入  (44/44)
+PASS  2d 规则文件已拷贝到位
+PASS  2k 配置里已打开管理 API  (port=19099)
+PASS  3 取到最新内核版本  (v1.19.32)
+PASS  3b 内核下载并解压成功  (61MB)
+PASS  4 内核启动成功  (pid=8524 564ms)
+PASS  4b 端口已监听  (port=7899)
+PASS  4c ★ 内核没有占 7890（FlClash 的默认端口）  (mixed-port=7899)
+PASS  4d ★ DNS 没有占 1053（FlClashCore 的端口）  (listen: 127.0.0.1:15353)
+PASS  5 能连上代理端口
+PASS  5b 走内核代理能出国（CONNECT 隧道）  (HTTP 200 ip=42.200.172.28)
+PASS  6 内核 PID 已记录  (pid=8524)
+PASS  6b 空闲后已自动关闭  (pid=8524 alive=false)
+PASS  6c 租约文件已清理
+RESULT: <n>/<n> passed
 ```
+
+(The exact count depends on whether the optional node tests can reach the internet;
+the run exits non-zero the moment any check fails.)
+
+The port-isolation checks are the regression guard for this whole cleanup: the
+built-in template must default to 7899 (`0a`), an imported config carrying `7890`
+must be rewritten (`0d ★`), and a `settings.state` still holding the old `7890` must
+be migrated on read (`0i ★`).
+
+DNS follows the same reasoning, and it is the subtler half. A config left on
+`1053` (FlClashCore's port) still listens on the proxy port and still runs
+commands — but DNS never comes up, nothing resolves, and the symptom is *"every
+node times out on the speed test"*. So both `dsh-proxy prepare` and the host's
+`ensureControllerInConfig()` repair it in place with
+`forceDnsPort(text, 15353, { onlyIfPorts: [1053] })`, which rewrites **only that
+dangerous value** and leaves an already-safe port (say `1055`) alone — otherwise
+every start would rewrite the file and log a line for nothing. `0c2` and `0c3`
+pin down exactly that "only the dangerous value" semantics.
+
+Group 4 repeats the port guard against the live kernel — `4c ★` asserts the
+running core did not take 7890, `4d ★` that DNS did not take 1053. If someone
+ever reverts the port, selftest fails loudly instead of the collision quietly
+coming back.
 
 ## Disclaimer
 

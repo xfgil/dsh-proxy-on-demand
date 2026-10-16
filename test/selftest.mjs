@@ -19,17 +19,23 @@ import { existsSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { createServer as createNetServer } from 'node:net';
 
-import { materialize, findFlClashConfig, forceExternalController, forceDnsPort, readExternalController } from '../lib/config.js';
+import { materialize, findFlClashConfig, forceExternalController, forceDnsPort, forceMixedPort, readExternalController, exampleConfig } from '../lib/config.js';
 import { ensureKernel, latestVersion } from '../lib/downloader.js';
 import { ProxyCore } from '../lib/core.js';
-import { countProxies, countRules, configSummary, writeManualConfig } from '../lib/settings.js';
+import { countProxies, countRules, configSummary, writeManualConfig, readSettings } from '../lib/settings.js';
 import { listProxies, testConnectivity, testGroupDelay, sampleActivity, FAILED_AT_MS } from '../lib/nodes.js';
 import { proxyGet } from '../lib/index.js';
-import { buildRestoreScript } from '../lib/systemproxy.js';
 
 const RUNTIME = 'C:\\Users\\暝\\AppData\\Local\\Temp\\dsh-proxy-selftest';
-/** 管理 API 端口与密钥（自测专用；真实运行由 index.js 动态分配）。 */
-const CTL_PORT = 9099;
+/**
+ * 管理 API 端口与密钥（自测专用；真实运行由 index.js 动态分配）。
+ *
+ * ⚠ 故意**不要**用 9099：`lib/index.js` 的 `controllerEndpoint()` 把
+ * `[9090, 9110)` 整段判为「旧起点（pickFreePort(9090)）的残留」并强制重挑，
+ * 自测值是直接传进 `materialize()` 的、不经过那段迁移，但撞在同一个区间里
+ * 会让后来读代码的人以为迁移失灵。用 19099 —— 和真实起点 19090 同段。
+ */
+const CTL_PORT = 19099;
 const CTL_SECRET = 'selftest-secret';
 const results = [];
 const check = (name, cond, detail = '') => results.push({ name, pass: !!cond, detail });
@@ -56,46 +62,70 @@ await fsp.mkdir(join(RUNTIME, 'providers', 'rules'), { recursive: true });
 if (existsSync(STASH)) await fsp.copyFile(STASH, KERNEL_EXE);
 
 try {
-  // 0. 纯离线：系统代理「还原脚本」的防线（只拼字符串，**不碰注册表**）
+  // ── 0. 端口隔离：生成的配置绝不能落在 FlClash 的地盘上 ────────────────────
   //
-  // 2026-10-13 真实事故：用户自定的 17 项绕过列表
-  // （`*zhihu.com;*zhimg.com;*jd.com;...`，与 FlClash shared_preferences 里的
-  //  bypassDomain 完全一致）被抹成了空。成因是**备份基线本身已被污染** ——
-  //  备份里 `override` 就是空，于是每次「精确还原」都把空值写回去；而验证脚本
-  //  逐字段比对备份与还原结果，两边都是空，反而**全部通过**，把问题掩盖了。
+  // 2026-10-16 用户报：「插件代理的时候 FlClash 内核连不上」。
+  // 根因是三条全踩在 FlClash 头上：
+  //   · mixed-port 7890   ← FlClash 默认混合端口，正面撞车
+  //   · external-controller 9090 ← FlClashCore 的惯例端口
+  //   · dns.listen 1053   ← FlClashCore 占着 → DNS 起不来 → 测速全超时
+  // 插件自己的内核改用 7899；DNS 避开 1053（从 15353 起找空闲）。
   //
-  // 所以这里锁死一条规则：**空 override 绝不主动写回**。宁可留下我们写的自环
-  // 保护项，也绝不把用户的绕过列表抹掉。断言直接查生成的脚本文本，
-  // 比拿真注册表做实验安全得多。
+  // 这一节是纯离线的回归锁（只拼字符串），不依赖机器上开着什么。
   {
-    const withOv = buildRestoreScript({
-      enable: 1, server: 'x:1', override: 'a;b', autoConfig: '',
-    });
-    check('0a 非空绕过列表照常写回',
-      withOv.includes("Set-ItemProperty -Path $k -Name ProxyOverride -Value 'a;b'"), '');
+    const ex = exampleConfig();
+    check('0a 内置模板的默认端口是 7899 而不是 7890',
+      /^\s*mixed-port:\s*7899\s*$/m.test(ex),
+      (ex.split('\n').find((l) => /mixed-port/.test(l)) ?? '').trim());
+    check('0b 内置模板不含 7890', !/:\s*7890\s*$/m.test(ex), '');
 
-    const emptyOv = buildRestoreScript({
-      enable: 1, server: 'x:1', override: '', overrideExisted: true, autoConfig: '',
-    });
-    check('0b 空绕过列表绝不写回（保留现值）',
-      !emptyOv.includes('Set-ItemProperty -Path $k -Name ProxyOverride'),
-      '备份被污染时不该拿空值覆盖用户的绕过列表');
+    // DNS：把 1053 这个历史默认值挤开
+    const dns = await forceDnsPort('dns:\n  enable: true\n  listen: 127.0.0.1:1053\n', 15353);
+    check('0c DNS 起始端口不再是 1053',
+      !/listen:\s*127\.0\.0\.1:1053\s*$/m.test(dns.text),
+      (dns.text.split('\n').find((l) => /listen:/.test(l)) ?? '').trim());
 
-    const neverHad = buildRestoreScript({
-      enable: 1, server: 'x:1', override: '', overrideExisted: false, autoConfig: '',
-    });
-    check('0c 原本就没有该值时才删除它',
-      neverHad.includes('Remove-ItemProperty -Path $k -Name ProxyOverride'), '');
+    // onlyIfPorts：存量配置的修补路径用「只修危险值」模式 —— 已经安全的
+    // 端口（比如上次挑好的 1055）不该每次启动都被重挑一遍（白写盘 + 日志噪音）。
+    const safeDns = 'dns:\n  enable: true\n  listen: 127.0.0.1:1055\n';
+    const keep = await forceDnsPort(safeDns, 15353, { onlyIfPorts: [1053] });
+    check('0c2 onlyIfPorts：安全端口不被无谓重挑', keep.changed === false && /:1055\s*$/.test(keep.text), `changed=${keep.changed}`);
+    const riskyDns = 'dns:\n  enable: true\n  listen: 127.0.0.1:1053\n';
+    const fixed = await forceDnsPort(riskyDns, 15353, { onlyIfPorts: [1053] });
+    check('0c3 onlyIfPorts：命中 1053 时照样修',
+      fixed.changed === true && !/:1053\s*$/m.test(fixed.text), `port=${fixed.port}`);
 
-    const legacy = buildRestoreScript({ enable: 0, server: '', override: '', autoConfig: '' });
-    check('0d 老备份（无 overrideExisted 字段）既不写也不删',
-      !legacy.includes('Set-ItemProperty -Path $k -Name ProxyOverride')
-      && !legacy.includes('Remove-ItemProperty -Path $k -Name ProxyOverride'), '');
+    // ★ 出口端口：导入的 FlClash 配置写着 mixed-port: 7890，必须被换掉。
+    //
+    // 这是最要紧的一条 —— 端口隔离光改默认值没用：**每个老用户的
+    // settings.state 和 config.yaml 里都存着 7890**，不主动迁移就等于没改。
+    // 见 config.js 的 forceMixedPort 与 settings.js 里的 7890→7899 迁移。
+    const mp = forceMixedPort('mode: rule\nmixed-port: 7890\nallow-lan: false\n', 7899);
+    check('0d ★ 导入配置里的 7890 被换成 7899',
+      /^mixed-port: 7899$/m.test(mp.text) && mp.changed === true && mp.from === 7890,
+      `changed=${mp.changed} from=${mp.from}`);
+    check('0e 已经是目标端口时不重复改（幂等）',
+      forceMixedPort(mp.text, 7899).changed === false, '');
+    check('0f 没有 mixed-port 时不瞎插一行',
+      forceMixedPort('mode: rule\n', 7899).changed === false, '');
+    // mixed-port: 0 是「明确关掉这一项」，不能给打开
+    check('0g mixed-port: 0 保持不动（不替用户打开监听面）',
+      forceMixedPort('mixed-port: 0\n', 7899).changed === false, '');
+    // Clash 老写法只有 port:
+    check('0h 只有 port: 时也能换（老式写法）',
+      /^port: 7899$/m.test(forceMixedPort('port: 7890\nsocks-port: 0\n', 7899).text), '');
 
-    check('0e 跳过绕过列表不影响其余字段照常还原',
-      legacy.includes('-Value 0 -Type DWord')
-      && legacy.includes('ProxyServer')
-      && legacy.includes('AutoConfigURL'), '');
+    // 老 settings.state 里的 7890 也要能被迁走
+    {
+      const tmp = join(RUNTIME, '..', 'dsh-proxy-selftest-port');
+      rmSync(tmp, { recursive: true, force: true });
+      await fsp.mkdir(tmp, { recursive: true });
+      await fsp.writeFile(join(tmp, 'settings.state'),
+        JSON.stringify({ enabled: true, port: 7890, idleMs: 120000 }), 'utf8');
+      const s = await readSettings(tmp);
+      check('0i ★ 旧设置文件里的 port: 7890 被迁到 7899', Number(s.port) === 7899, `port=${s.port}`);
+      rmSync(tmp, { recursive: true, force: true });
+    }
   }
 
   // 1. 找 FlClash 配置
@@ -181,10 +211,10 @@ try {
       ['写成别的端口', 'external-controller: 0.0.0.0:9999\n'],
     ];
     for (const [label, src] of cases) {
-      const out = forceExternalController(src, 9099, 'SEC');
+      const out = forceExternalController(src, 19099, 'SEC');
       const got = readExternalController(out.text);
       check(`2n external-controller 覆盖正确（${label}）`,
-        got.port === 9099 && got.host === '127.0.0.1' && got.secret === 'SEC',
+        got.port === 19099 && got.host === '127.0.0.1' && got.secret === 'SEC',
         `port=${got.port} host=${got.host}`);
       // 只应有一条，不能重复（重复会让内核解析失败）
       const n = (out.text.match(/^external-controller:/gm) || []).length;
@@ -266,8 +296,12 @@ try {
     check('3b 内核下载并解压成功', k.ok && k.bytes > 20e6, `${Math.round(k.bytes / 1e6)}MB`);
   }
 
-  // 4. 拉起内核（用 7891 避开可能占用的 7890）
-  const port = 7891;
+  // 4. 拉起内核（用 7899 —— 插件自己的默认端口，也是要验证它不撞 FlClash）
+  //
+  // 以前这里用 7891「避开可能占用的 7890」。那是在插件自己也想用 7890 的年代。
+  // 现在插件默认 7899，自测就用它 —— 顺便验证这个新默认值真能起来。
+  // （FlClash 占着 7890 也不影响：两边已经不在同一个端口上了。）
+  const port = 7899;
   const core = new ProxyCore({
     dir: RUNTIME, exe: 'mihomo.exe', config: 'config.yaml',
     port, idleMs: 20000, tickMs: 3000, log: (l, m) => console.log(`   [${l}] ${m}`),
@@ -275,13 +309,21 @@ try {
   // 改端口：直接改写生成的 config
   let t = await fsp.readFile(join(RUNTIME, 'config.yaml'), 'utf8');
   t = t.replace(/mixed-port:\s*\d+/, `mixed-port: ${port}`);
-  // DNS 1053 可能被占，换掉以免干扰自测
-  t = t.replace(/listen:\s*"?[0-9.]+:1053"?/, 'listen: "127.0.0.1:1054"');
+  // DNS 端口由 forceDnsPort 从 15353 起挑，理论上不再撞 1053；
+  // 但 15353 也可能被占，这里不假定，直接把结果读出来做断言（见 4c）。
   await fsp.writeFile(join(RUNTIME, 'config.yaml'), t, 'utf8');
 
   const started = await core.start();
   check('4 内核启动成功', started.started === true, `pid=${started.pid} ${started.ms}ms`);
   check('4b 端口已监听', await core.portUp(port), `port=${port}`);
+  // ★ 端口隔离的回归锁：插件自己的内核绝不能落在 FlClash 的 7890 上。
+  {
+    const cfgNow = await fsp.readFile(join(RUNTIME, 'config.yaml'), 'utf8');
+    const mp = (cfgNow.match(/^mixed-port:\s*(\d+)/m) ?? [])[1];
+    check('4c ★ 内核没有占 7890（FlClash 的默认端口）', mp === String(port) && mp !== '7890', `mixed-port=${mp}`);
+    const dnsListen = cfgNow.split('\n').find((l, i) => /^\s+listen:/.test(l) && cfgNow.split('\n').slice(0, i).some((x) => /^dns:\s*$/.test(x))) ?? '';
+    check('4d ★ DNS 没有占 1053（FlClashCore 的端口）', !/:1053\b/.test(dnsListen), dnsListen.trim());
+  }
 
   // 5. 代理真的能用
   const net = await import('node:net');

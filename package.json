@@ -1,7 +1,7 @@
 {
   "name": "dsh-proxy-on-demand",
-  "version": "0.1.0",
-  "description": "DSH 按需代理插件：需要时自动拉起 mihomo 内核，空闲后自动关闭，平时不占端口、不留后台进程。自带设置界面，可填订阅、从 FlClash 导入或手动粘贴节点。检测到全屏游戏运行时不启用代理，避免破坏游戏体验；检测到其它代理（FlClash 等）已在运行时自动静默让路，不抢端口。首次运行会自动联网下载内核（约 61MB）到插件目录，删掉即清除。On-demand proxy for DeepSeek Harness: spawns a mihomo core only when needed and shuts it down automatically when idle.",
+  "version": "0.2.0",
+  "description": "DSH 按需代理插件（给 Agent 用的工具）：需要时自动拉起 mihomo 内核，空闲后自动关闭，平时不占端口、不留后台进程。本机已有别的代理（FlClash 等）在跑时直接借道它的出口，一个进程都不起；自己的内核用 7899 而非 7890，不跟 FlClash 抢端口。永不改 Windows 系统代理设置。HTTP 接口 + 必要 CLI 是主入口，设置界面只保留配置来源（订阅 / 从 FlClash 导入 / 手动粘贴）。首次运行会自动联网下载内核（约 61MB）到插件目录，删掉即清除。On-demand proxy for DeepSeek Harness: spawns a mihomo core only when needed, shuts it down when idle, and borrows an already-running local proxy instead of competing for its port.",
   "private": false,
   "type": "module",
   "main": "lib/index.js",
@@ -49,10 +49,9 @@
     "on-demand",
     "auto-shutdown",
     "idle-timeout",
-    "game-detection",
-    "fullscreen",
     "proxy-detection",
-    "yield"
+    "borrow",
+    "agent-tool"
   ],
   "repository": {
     "type": "git",

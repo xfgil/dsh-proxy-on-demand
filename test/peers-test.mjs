@@ -1,8 +1,8 @@
 /**
- * 代理礼让 —— 离线判定测试
+ * 借道探测 —— 离线判定测试
  *
- * 用途：验证 lib/peers.js 的判定规则，**完全不碰真实网络**。
- *   判定核心 evaluatePeers() 是纯函数（吃构造的端口探测结果、吐结论），
+ * 用途：验证 lib/peers.js 的借道规则，**完全不碰真实网络**。
+ *   判定核心 evaluateBorrow() 是纯函数（吃构造的端口探测结果、吐结论），
  *   所以这里能精确覆盖每种组合，不受测试机上当时开着什么代理影响。
  *
  * 上游程序：本项目运行时会下载 mihomo（© MetaCubeX，GPL-3.0）；
@@ -14,7 +14,7 @@
  * 运行：node test/peers-test.mjs
  */
 import {
-  COMMON_PROXY_PORTS, describePeer, evaluatePeers, PEER_DEFAULTS,
+  BORROW_TTL_MS, COMMON_PROXY_PORTS, evaluateBorrow,
 } from '../lib/peers.js';
 
 let pass = 0;
@@ -36,82 +36,91 @@ function check(name, cond, extra = '') {
 const up = (port) => ({ port, up: true, ms: 1 });
 const down = (port) => ({ port, up: false, ms: 1 });
 
-console.log('=== 代理礼让 离线测试 ===\n');
+const ORDER = COMMON_PROXY_PORTS;
 
-// ── 1. 基础：都没人监听 → 不让路 ─────────────────────────────────
+console.log('=== 借道探测 离线测试 ===\n');
+
+// ── 1. 基础：都没人监听 → 没得借 ─────────────────────────────────
 {
-  const d = evaluatePeers({ ownPort: 7890, ownAlive: false, results: [down(7890), down(10808)] });
-  check('1 端口全空 → 不让路', d.peerRunning === false);
-  check('1b 不让路时无 hit', d.hits.length === 0);
-  check('1c describePeer 说没检测到', describePeer(d) === '未检测到其它代理');
+  const d = evaluateBorrow({ ownPort: 7899, results: [down(7890), down(10808)], order: ORDER });
+  check('1 端口全空 → 没有可借目标', d === null);
 }
 
-// ── 2. 常见代理端口有人监听 → 让路 ───────────────────────────────
+// ── 2. FlClash 在跑（7890）→ 借它 ────────────────────────────────
 {
-  const d = evaluatePeers({ ownPort: 7890, ownAlive: false, results: [down(7890), up(10808)] });
-  check('2 常见代理端口被监听 → 让路', d.peerRunning === true);
-  check('2b hit 的 kind 是 port', d.hits[0]?.kind === 'port', `kind=${d.hits[0]?.kind}`);
-  check('2c hit 记录端口号', d.hits[0]?.port === 10808);
+  const d = evaluateBorrow({
+    ownPort: 7899, results: [up(7890), down(10808)], order: ORDER,
+  });
+  check('2 7890 在监听 → 借道 7890', d?.port === 7890, `port=${d?.port}`);
+  check('2b note 说明「不启动自己的内核」', /不启动自己的内核/.test(d?.note ?? ''), d?.note);
+  check('2c note 带上端口号', /7890/.test(d?.note ?? ''));
 }
 
-// ── 3. ★ 自己的内核监听自己的端口 → 不算「别人」 ─────────────────
+// ── 3. ★ 名单顺序即优先级：7890 与 7897 都开着 → 选 7890 ──────────
 {
-  const d = evaluatePeers({ ownPort: 7890, ownAlive: true, results: [up(7890)] });
-  check('3 ★ 自己的内核占自己的端口 → 不让路（否则永远自我阻断）', d.peerRunning === false);
+  const d = evaluateBorrow({
+    ownPort: 7899, results: [up(7897), up(7890)], order: ORDER,
+  });
+  check('3 ★ 按名单顺序而非端口号：选 7890（FlClash 优先）', d?.port === 7890, `port=${d?.port}`);
 
-  // 同一端口，但内核没活（说明是别的程序占的）
-  const d2 = evaluatePeers({ ownPort: 7890, ownAlive: false, results: [up(7890)] });
-  check('3b 同一端口但自己没活 → 那是别人的，让路', d2.peerRunning === true);
-  check('3c 这种 hit 的 kind 是 own-port', d2.hits[0]?.kind === 'own-port', `kind=${d2.hits[0]?.kind}`);
-  check('3d own-port 的说明提到「本插件要用的端口」', /本插件要用的端口/.test(d2.hits[0]?.note ?? ''));
+  // 反过来构造（results 顺序颠倒）结论必须一样
+  const d2 = evaluateBorrow({
+    ownPort: 7899, results: [up(7890), up(7897)], order: ORDER,
+  });
+  check('3b results 顺序不影响结论', d2?.port === 7890);
 }
 
-// ── 4. 自己的内核活着，同时还有别的代理 → 仍然让路 ───────────────
+// ── 4. ★ 自己的端口永远不算「可借」 ──────────────────────────────
 {
-  const d = evaluatePeers({ ownPort: 7890, ownAlive: true, results: [up(7890), up(10808)] });
-  check('4 自己活着但还有别人 → 让路', d.peerRunning === true);
-  check('4b 只把别人算进 hit（自己的被排除）', d.hits.length === 1 && d.hits[0].port === 10808);
+  const d = evaluateBorrow({ ownPort: 7899, results: [up(7899)], order: ORDER });
+  check('4 ★ 只有自己的端口在监听 → 不借（否则自己借自己）', d === null);
+
+  const d2 = evaluateBorrow({
+    ownPort: 7899, results: [up(7899), up(7890)], order: ORDER,
+  });
+  check('4b 自己 + 别人都在 → 借别人的', d2?.port === 7890, `port=${d2?.port}`);
 }
 
-// ── 5. 多个端口被占：hit 按端口升序 ──────────────────────────────
+// ── 5. extraPorts 优先于名单 ────────────────────────────────────
 {
-  const d = evaluatePeers({ ownPort: 7890, ownAlive: false, results: [up(20171), up(1080), up(7897)] });
-  check('5 多个端口被占 → 全部记录', d.hits.length === 3, `n=${d.hits.length}`);
-  check('5b hit 按端口升序', d.hits.map((h) => h.port).join(',') === '1080,7897,20171',
-    d.hits.map((h) => h.port).join(','));
-  check('5c describePeer 列出端口', /1080、7897、20171/.test(describePeer(d)), describePeer(d));
+  const d = evaluateBorrow({
+    ownPort: 7899, results: [up(7890), up(12345)], order: [12345, ...ORDER],
+  });
+  check('5 extraPorts 排前面 → 优先借 12345', d?.port === 12345, `port=${d?.port}`);
 }
 
 // ── 6. 边界：空输入 / 缺字段 / null 都不崩 ───────────────────────
 {
-  const a = evaluatePeers();
-  check('6 无参数 → 不让路且不崩', a.peerRunning === false && Array.isArray(a.hits));
-  const b = evaluatePeers({ results: [] });
-  check('6b 空 results → 不让路', b.peerRunning === false);
-  const c = evaluatePeers({ results: [null, undefined, {}, { port: 10808 }] });
-  check('6c 残缺条目被忽略（缺 up 不算被占）', c.peerRunning === false, `hits=${c.hits.length}`);
-  const e = evaluatePeers({ results: [up(10808), null, up(1080)] });
-  check('6d 混合残缺条目仍能正确统计', e.hits.length === 2, `n=${e.hits.length}`);
-  check('6e describePeer(null) 不崩', typeof describePeer(null) === 'string');
+  const a = evaluateBorrow();
+  check('6 无参数 → null 且不崩', a === null);
+  const b = evaluateBorrow({ results: [] });
+  check('6b 空 results → null', b === null);
+  const c = evaluateBorrow({ results: [null, undefined, {}, { port: 10808 }] });
+  check('6c 残缺条目被忽略（缺 up 不算被监听）', c === null);
+  const e = evaluateBorrow({
+    ownPort: 7899, results: [up(10808), null, up(1080)], order: ORDER,
+  });
+  check('6d 混合残缺条目仍能挑出正确目标', e?.port === 10808, `port=${e?.port}`);
+  const f = evaluateBorrow({ ownPort: 7899, results: [up(10808)], order: [] });
+  check('6e order 为空 → 不挑', f === null);
+  const g = evaluateBorrow({ ownPort: 7899, results: [up(7890)], order: [null, undefined, 7890] });
+  check('6f order 里的残缺项被跳过', g?.port === 7890);
 }
 
-// ── 7. 默认值与端口名单 ──────────────────────────────────────────
+// ── 7. 端口名单 ──────────────────────────────────────────────────
 {
-  check('7 PEER_DEFAULTS.yieldToPeer 默认开', PEER_DEFAULTS.yieldToPeer === true);
-  check('7b 默认端口 7890 在名单里', COMMON_PROXY_PORTS.includes(7890));
-  check('7c 名单含主流代理端口', [10808, 1080, 7897].every((p) => COMMON_PROXY_PORTS.includes(p)));
-  check('7d 名单无重复', new Set(COMMON_PROXY_PORTS).size === COMMON_PROXY_PORTS.length,
+  check('7 名单里没有本插件自己的端口 7899', !COMMON_PROXY_PORTS.includes(7899));
+  check('7b 名单含主流代理端口', [7890, 10808, 1080, 7897].every((p) => COMMON_PROXY_PORTS.includes(p)));
+  check('7c 名单无重复', new Set(COMMON_PROXY_PORTS).size === COMMON_PROXY_PORTS.length,
     `n=${COMMON_PROXY_PORTS.length}`);
-  check('7e 名单全是合法端口号', COMMON_PROXY_PORTS.every((p) => Number.isInteger(p) && p > 0 && p < 65536));
+  check('7d 名单全是合法端口号', COMMON_PROXY_PORTS.every((p) => Number.isInteger(p) && p > 0 && p < 65536));
+  check('7e 名单不含 9090（FlClashCore 的控制器端口，不是代理端口）',
+    !COMMON_PROXY_PORTS.includes(9090));
 }
 
-// ── 8. 用户把开关关掉时，闸门本身不拦（peerGate 的 disabled 分支）──
+// ── 8. 缓存时长是个正数 ─────────────────────────────────────────
 {
-  // 这里只验证 evaluatePeers 的语义：检测结论与"要不要拦"是两回事。
-  // 真正的开关判断在 peerGate() 里（见 lib/peers.js），它需要联网探测，
-  // 因此不在离线测试范围内。
-  const d = evaluatePeers({ ownPort: 7890, ownAlive: false, results: [up(10808)] });
-  check('8 检测结论与开关解耦：检测到就是 peerRunning=true', d.peerRunning === true);
+  check('8 BORROW_TTL_MS 是正数', Number.isFinite(BORROW_TTL_MS) && BORROW_TTL_MS > 0, `${BORROW_TTL_MS}`);
 }
 
 console.log(`\n=== ${pass}/${pass + fail} PASS ===`);
